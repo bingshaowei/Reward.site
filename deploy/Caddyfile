@@ -1,0 +1,14 @@
+{$SITE_ADDRESS} {
+    encode zstd gzip
+    request_body {
+        max_size 105906176
+    }
+    reverse_proxy app:3000 {
+        header_up X-Real-IP {remote_host}
+    }
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        Referrer-Policy same-origin
+    }
+}

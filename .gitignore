@@ -1,0 +1,12 @@
+node_modules/
+.next/
+.env
+.env.local
+.data/
+data/
+coverage/
+*.tsbuildinfo
+test-results/
+.superpowers/
+dist/
+backups/

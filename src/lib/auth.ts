@@ -1,0 +1,107 @@
+import { randomBytes, randomUUID, createHash, scrypt, timingSafeEqual } from 'node:crypto';
+import type { Pool } from 'pg';
+import { z } from 'zod';
+import { rows, transaction, type Db } from './db';
+import { ensure } from './rules';
+import type { User } from './types';
+
+export const publicUserFields = 'id,username,name,role,active,must_change_password';
+export const tokenHash = (value: string) => createHash('sha256').update(value).digest('hex');
+function derive(password: string, salt: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => scrypt(password, salt, 64, { N: 16384, r: 8, p: 1 }, (error, key) => error ? reject(error) : resolve(key)));
+}
+export async function hashPassword(password: string) {
+  const salt = randomBytes(16).toString('hex');
+  return `scrypt$${salt}$${(await derive(password, salt)).toString('hex')}`;
+}
+async function verifyPassword(password: string, encoded: string) {
+  const [algorithm, salt, hex] = encoded.split('$');
+  if (algorithm !== 'scrypt' || !salt || !hex) return false;
+  const actual = await derive(password, salt), expected = Buffer.from(hex, 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+const dummyHash = hashPassword(randomBytes(32).toString('hex'));
+const passwordInput = z.string().min(12, '密码至少12位').max(128, '密码最多128位');
+
+export async function login(pool: Pool, username: string, password: string, ip: string) {
+  ensure(typeof username === 'string' && username.length <= 64 && typeof password === 'string' && password.length <= 128, '账号或密码不正确', 401);
+  const keys = [tokenHash(`account:${username.toLowerCase()}`), tokenHash(`ip:${ip}`)];
+  for (let i = 0; i < keys.length; i++) {
+    const [attempt] = await rows(pool, `INSERT INTO login_attempts(key) VALUES($1) ON CONFLICT(key) DO UPDATE SET
+      attempts=CASE WHEN login_attempts.started_at < now()-interval '15 minutes' THEN 1 ELSE login_attempts.attempts+1 END,
+      started_at=CASE WHEN login_attempts.started_at < now()-interval '15 minutes' THEN now() ELSE login_attempts.started_at END RETURNING attempts`, [keys[i]]);
+    ensure(attempt.attempts <= (i === 0 ? 10 : 60), '登录尝试过多，请15分钟后再试', 429);
+  }
+  const [record] = await rows(pool, `SELECT ${publicUserFields},password_hash FROM users WHERE username=$1`, [username.toLowerCase()]);
+  const valid = await verifyPassword(password, record?.password_hash ?? await dummyHash);
+  ensure(record?.active && valid, '账号或密码不正确，或账号已停用', 401);
+  const { password_hash: _, ...user } = record;
+  return transaction(pool, async db => {
+    // 和重置/停用使用相同的行锁，避免并发重置后创建旧凭据会话。
+    const [current] = await rows(db, 'SELECT active,password_hash FROM users WHERE id=$1 FOR UPDATE', [user.id]);
+    ensure(current.active && current.password_hash === record.password_hash, '账号状态已变更，请重新登录', 401);
+    const token = randomBytes(32).toString('hex');
+    await db.query("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,now()+interval '7 days')", [tokenHash(token), user.id]);
+    await db.query('DELETE FROM login_attempts WHERE key=$1', [keys[0]]);
+    return { token, user: user as User };
+  });
+}
+export async function userForToken(db: Db, token: string | undefined | null): Promise<User | null> {
+  if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
+  const [user] = await rows<User>(db, `SELECT u.id,u.username,u.name,u.role,u.active,u.must_change_password FROM sessions s
+    JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now() AND u.active`, [tokenHash(token)]);
+  return user ?? null;
+}
+export async function logout(db: Db, token: string | undefined) {
+  if (token) await db.query('DELETE FROM sessions WHERE token_hash=$1', [tokenHash(token)]);
+}
+export async function createAccount(pool: Pool, actor: User, value: unknown) {
+  ensure(actor.role === 'admin', '仅管理员可以创建账号', 403);
+  const input = z.object({ username: z.string().trim().toLowerCase().regex(/^[a-z0-9_.-]{3,32}$/, '账号使用3至32位字母、数字、点、横线或下划线'), name: z.string().trim().min(1).max(40), password: passwordInput, role: z.enum(['admin', 'member']) }).parse(value);
+  const passwordHash = await hashPassword(input.password);
+  return transaction(pool, async db => {
+    const existing = await rows(db, 'SELECT id FROM users WHERE username=$1', [input.username]);
+    ensure(!existing.length, '这个账号已经存在');
+    const [user] = await rows<User>(db, `INSERT INTO users(id,username,name,password_hash,role) VALUES($1,$2,$3,$4,$5) RETURNING ${publicUserFields}`,
+      [randomUUID(), input.username, input.name, passwordHash, input.role]);
+    await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [actor.id, 'account.create', user.id]); return user;
+  });
+}
+export async function updateAccount(pool: Pool, actor: User, id: string, value: unknown) {
+  ensure(actor.role === 'admin', '仅管理员可以管理账号', 403);
+  const input = z.object({ password: passwordInput.optional(), active: z.boolean().optional() }).parse(value);
+  ensure(input.password !== undefined || input.active !== undefined, '没有需要修改的内容');
+  ensure(!(actor.id === id && input.active === false), '不能停用当前管理员账号');
+  const encoded = input.password ? await hashPassword(input.password) : null;
+  await transaction(pool, async db => {
+    const [user] = await rows(db, 'SELECT id FROM users WHERE id=$1 AND removed_at IS NULL FOR UPDATE', [id]); ensure(user, '账号不存在', 404);
+    await db.query(`UPDATE users SET password_hash=coalesce($2,password_hash), active=coalesce($3,active),
+      must_change_password=CASE WHEN $2::text IS NOT NULL THEN true ELSE must_change_password END WHERE id=$1`, [id, encoded, input.active ?? null]);
+    await db.query('DELETE FROM sessions WHERE user_id=$1', [id]);
+    await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [actor.id, encoded ? 'account.reset-password' : 'account.status', id]);
+  });
+}
+export async function removeAccount(pool: Pool, actor: User, id: string) {
+  ensure(actor.role === 'admin', '仅管理员可以删除账号', 403);
+  ensure(actor.id !== id, '不能删除当前管理员账号');
+  await transaction(pool, async db => {
+    const result = await db.query('UPDATE users SET active=false,removed_at=now() WHERE id=$1 AND removed_at IS NULL', [id]);
+    ensure(result.rowCount, '账号不存在', 404);
+    await db.query('DELETE FROM sessions WHERE user_id=$1', [id]);
+    await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [actor.id, 'account.remove', id]);
+  });
+}
+export async function changePassword(pool: Pool, user: User, oldPassword: string, newPassword: string) {
+  passwordInput.parse(newPassword); ensure(typeof oldPassword === 'string' && oldPassword.length <= 128, '原密码不正确');
+  const [record] = await rows(pool, 'SELECT password_hash FROM users WHERE id=$1', [user.id]);
+  ensure(record && await verifyPassword(oldPassword, record.password_hash), '原密码不正确');
+  ensure(oldPassword !== newPassword, '新密码不能与原密码相同');
+  const encoded = await hashPassword(newPassword);
+  await transaction(pool, async db => {
+    const [current] = await rows(db, 'SELECT password_hash FROM users WHERE id=$1 FOR UPDATE', [user.id]);
+    ensure(current.password_hash === record.password_hash, '密码已更新，请重新登录');
+    await db.query('UPDATE users SET password_hash=$2,must_change_password=false WHERE id=$1', [user.id, encoded]);
+    await db.query('DELETE FROM sessions WHERE user_id=$1', [user.id]);
+    await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [user.id, 'account.change-password', user.id]);
+  });
+}

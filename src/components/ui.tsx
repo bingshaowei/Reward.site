@@ -1,0 +1,20 @@
+'use client';
+import { useState } from 'react';
+import { Paperclip, FileText, X, Inbox, ArrowDownToLine } from 'lucide-react';
+import type { Attachment, Task } from '@/lib/types';
+import { date } from '@/lib/client';
+export const statusNames: Record<string, string> = { 'publication-pending': '待审核', 'publication-rejected': '已退回', open: '进行中', completed: '已完成', cancelled: '已取消', working: '进行中', submitted: '待验收', revision: '待修改', accepted: '已通过', withdrawn: '已退出', pending: '待验收', approved: '已通过' };
+export function Status({ value }: { value: string }) { return <span className={`badge status-${value}`}><span className="status-dot" />{statusNames[value] ?? value}</span>; }
+export function publicationDisplayStatus(task: Task) {
+  return task.status === 'open' && task.publication_status !== 'approved'
+    ? `publication-${task.publication_status}`
+    : task.status;
+}
+export function Empty({ title = '这里还没有内容', description = '新的工作进展会显示在这里。', children }: { title?: string; description?: string; children?: React.ReactNode }) { return <div className="empty"><Inbox size={35} strokeWidth={1.2} /><h3>{title}</h3><p>{description}</p>{children}</div>; }
+export function FilePicker({ files, onChange, reference = false }: { files: File[]; onChange: (files: File[]) => void; reference?: boolean }) {
+  const [error, setError] = useState('');
+  return <div className="file-picker"><label className="upload-area"><Paperclip size={20} /><strong>点击添加附件</strong><span>{reference ? "仅 ZIP、7Z、RAR，最多5个，合计不超过100MB" : "图片、PDF、办公文档、TXT、CSV、ZIP；最多5个，每个20MB"}</span><input type="file" multiple accept={reference ? ".zip,.7z,.rar" : ".jpg,.jpeg,.png,.webp,.pdf,.docx,.xlsx,.pptx,.txt,.csv,.zip"} onChange={e => { const selected = [...files, ...Array.from(e.target.files ?? [])]; if (selected.length > 5 || (!reference && selected.some(f => f.size > 20 * 1024 * 1024)) || (reference && (selected.some(f => !/\.(zip|7z|rar)$/i.test(f.name)) || selected.reduce((total, file) => total + file.size, 0) > 100 * 1024 * 1024))) { setError(reference ? '参考附件仅限 ZIP、7Z、RAR，最多5个且合计不超过100MB' : '最多5个附件，每个不超过20MB'); } else { setError(''); onChange(selected); } e.target.value = ''; }} /></label>{files.map((f, i) => <div className="file-item" key={`${f.name}-${i}`}><FileText size={16} /><span>{f.name}</span><small>{(f.size / 1024).toFixed(1)} KB</small><button type="button" className="icon-btn" aria-label={`移除待上传附件 ${f.name}`} onClick={() => onChange(files.filter((_, index) => index !== i))}><X size={15} /></button></div>)}{error && <p className="error-text" role="alert">{error}</p>}</div>;
+}
+export function Attachments({ files }: { files: Attachment[] }) {
+  return <div className="attachments">{files.map(a => { const expired = a.expired_at || (a.expires_at && new Date(a.expires_at).getTime() <= Date.now()); return <div key={a.id} className={`file-item ${expired ? 'expired' : ''}`}><FileText size={18} /><div><strong>{a.name}</strong><small>{(a.size / 1024).toFixed(1)} KB · {expired ? '保留期已结束' : a.expires_at ? `保留至 ${date(a.expires_at, true)}` : '任务结束后保留15天'}</small></div>{expired ? <span className="muted">已过期</span> : <a className="icon-btn" href={`/api/attachments/${a.id}`} aria-label={`下载 ${a.name}`}><ArrowDownToLine size={18} /></a>}</div>; })}</div>;
+}

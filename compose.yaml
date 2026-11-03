@@ -1,0 +1,71 @@
+name: internal-bounty
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bounty
+      POSTGRES_DB: bounty
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在.env设置数据库密码}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bounty -d bounty"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  app:
+    build: .
+    image: internal-bounty:local
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://bounty:${POSTGRES_PASSWORD}@db:5432/bounty
+      APP_ORIGIN: ${APP_ORIGIN:?请在.env设置访问地址}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请在.env设置初始管理员密码}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      TRUST_PROXY: "true"
+      UPLOAD_DIR: /app/data/uploads
+    volumes:
+      - uploads:/app/data
+    expose:
+      - "3000"
+  cleanup:
+    image: internal-bounty:local
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    depends_on:
+      app:
+        condition: service_healthy
+    entrypoint: ["node", "dist/cleanup.mjs"]
+    environment:
+      DATABASE_URL: postgres://bounty:${POSTGRES_PASSWORD}@db:5432/bounty
+      UPLOAD_DIR: /app/data/uploads
+    volumes:
+      - uploads:/app/data
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+volumes:
+  pgdata:
+  uploads:
+  caddy_data:
+  caddy_config:
