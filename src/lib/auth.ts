@@ -3,7 +3,7 @@ import type { Pool } from 'pg';
 import { z } from 'zod';
 import { rows, transaction, type Db } from './db';
 import { ensure } from './rules';
-import type { User } from './types';
+import type { RegistrationRequest, User } from './types';
 
 export const publicUserFields = 'id,username,name,role,active,must_change_password';
 export const tokenHash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -22,15 +22,24 @@ async function verifyPassword(password: string, encoded: string) {
 }
 const dummyHash = hashPassword(randomBytes(32).toString('hex'));
 const passwordInput = z.string().min(12, '密码至少12位').max(128, '密码最多128位');
+const accountInput = z.object({
+  username: z.string().trim().toLowerCase().regex(/^[a-z0-9_.-]{3,32}$/, '账号使用3至32位字母、数字、点、横线或下划线'),
+  name: z.string().trim().min(1).max(40),
+  password: passwordInput,
+});
+
+async function countAttempt(db: Db, key: string) {
+  const [attempt] = await rows(db, `INSERT INTO login_attempts(key) VALUES($1) ON CONFLICT(key) DO UPDATE SET
+    attempts=CASE WHEN login_attempts.started_at < now()-interval '15 minutes' THEN 1 ELSE login_attempts.attempts+1 END,
+    started_at=CASE WHEN login_attempts.started_at < now()-interval '15 minutes' THEN now() ELSE login_attempts.started_at END RETURNING attempts`, [key]);
+  return Number(attempt.attempts);
+}
 
 export async function login(pool: Pool, username: string, password: string, ip: string) {
   ensure(typeof username === 'string' && username.length <= 64 && typeof password === 'string' && password.length <= 128, '账号或密码不正确', 401);
   const keys = [tokenHash(`account:${username.toLowerCase()}`), tokenHash(`ip:${ip}`)];
   for (let i = 0; i < keys.length; i++) {
-    const [attempt] = await rows(pool, `INSERT INTO login_attempts(key) VALUES($1) ON CONFLICT(key) DO UPDATE SET
-      attempts=CASE WHEN login_attempts.started_at < now()-interval '15 minutes' THEN 1 ELSE login_attempts.attempts+1 END,
-      started_at=CASE WHEN login_attempts.started_at < now()-interval '15 minutes' THEN now() ELSE login_attempts.started_at END RETURNING attempts`, [keys[i]]);
-    ensure(attempt.attempts <= (i === 0 ? 10 : 60), '登录尝试过多，请15分钟后再试', 429);
+    ensure(await countAttempt(pool, keys[i]) <= (i === 0 ? 10 : 60), '登录尝试过多，请15分钟后再试', 429);
   }
   const [record] = await rows(pool, `SELECT ${publicUserFields},password_hash FROM users WHERE username=$1`, [username.toLowerCase()]);
   const valid = await verifyPassword(password, record?.password_hash ?? await dummyHash);
@@ -57,7 +66,7 @@ export async function logout(db: Db, token: string | undefined) {
 }
 export async function createAccount(pool: Pool, actor: User, value: unknown) {
   ensure(actor.role === 'admin', '仅管理员可以创建账号', 403);
-  const input = z.object({ username: z.string().trim().toLowerCase().regex(/^[a-z0-9_.-]{3,32}$/, '账号使用3至32位字母、数字、点、横线或下划线'), name: z.string().trim().min(1).max(40), password: passwordInput, role: z.enum(['admin', 'member']) }).parse(value);
+  const input = accountInput.extend({ role: z.enum(['admin', 'member']) }).parse(value);
   const passwordHash = await hashPassword(input.password);
   return transaction(pool, async db => {
     const existing = await rows(db, 'SELECT id FROM users WHERE username=$1', [input.username]);
@@ -65,6 +74,40 @@ export async function createAccount(pool: Pool, actor: User, value: unknown) {
     const [user] = await rows<User>(db, `INSERT INTO users(id,username,name,password_hash,role) VALUES($1,$2,$3,$4,$5) RETURNING ${publicUserFields}`,
       [randomUUID(), input.username, input.name, passwordHash, input.role]);
     await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [actor.id, 'account.create', user.id]); return user;
+  });
+}
+
+export async function requestRegistration(pool: Pool, value: unknown, ip: string) {
+  const input = accountInput.parse(value);
+  ensure(await countAttempt(pool, tokenHash(`registration:${ip}`)) <= 10, '注册申请过多，请15分钟后再试', 429);
+  const passwordHash = await hashPassword(input.password);
+  await transaction(pool, async db => {
+    const result = await db.query(`INSERT INTO registration_requests(id,username,name,password_hash)
+      VALUES($1,$2,$3,$4) ON CONFLICT (username) DO NOTHING`,
+      [randomUUID(), input.username, input.name, passwordHash]);
+    const existing = await rows(db, 'SELECT id FROM users WHERE username=$1', [input.username]);
+    ensure(result.rowCount && !existing.length, '该账号已存在或已有待审核申请', 409);
+  });
+}
+
+export function listRegistrationRequests(db: Db) {
+  return rows<RegistrationRequest>(db, 'SELECT id,username,name FROM registration_requests ORDER BY created_at,id');
+}
+
+export async function reviewRegistration(pool: Pool, actor: User, id: string, approve: boolean) {
+  ensure(actor.role === 'admin', '仅管理员可以审核注册申请', 403);
+  await transaction(pool, async db => {
+    const [request] = await rows(db, 'SELECT username,name,password_hash FROM registration_requests WHERE id=$1 FOR UPDATE', [id]);
+    ensure(request, '注册申请已处理或不存在', 409);
+    if (approve) {
+      const result = await db.query(`INSERT INTO users(id,username,name,password_hash,role,must_change_password)
+        VALUES($1,$2,$3,$4,'member',false) ON CONFLICT (username) DO NOTHING`,
+        [id, request.username, request.name, request.password_hash]);
+      ensure(result.rowCount, '该账号已存在，可以拒绝此申请', 409);
+    }
+    await db.query('DELETE FROM registration_requests WHERE id=$1', [id]);
+    await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)',
+      [actor.id, approve ? 'registration.approve' : 'registration.reject', id]);
   });
 }
 export async function updateAccount(pool: Pool, actor: User, id: string, value: unknown) {

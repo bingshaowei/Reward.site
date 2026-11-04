@@ -137,6 +137,10 @@ body { font-size: 15px; }
   .hero-stamp { width: 205px; height: 205px; flex-shrink: 0; }
 }
 
+@media (min-width: 1201px) and (min-height: 858px) {
+  .sidebar { min-height: 860px; }
+}
+
 @media (max-width: 900px) {
   .sidebar-note strong { font-size: 15px; }
 }
@@ -145,3 +149,7 @@ body { font-size: 15px; }
   .page-top:has(.top-date) { flex-wrap: wrap; gap: 4px 12px; padding-block: 8px; }
   .top-date { font-size: 13px; }
 }
+
+.login-card label[for="login-password"] { margin-bottom: 8px; }
+.login-password { margin-bottom: 22px; background: #e4d7b9; }
+.login-password .icon-btn { flex-shrink: 0; }

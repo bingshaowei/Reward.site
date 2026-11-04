@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z, ZodError } from 'zod';
 import { getPool, rows } from '@/lib/db';
-import { login, logout, userForToken, createAccount, updateAccount, removeAccount, changePassword, publicUserFields } from '@/lib/auth';
+import { login, logout, userForToken, createAccount, updateAccount, removeAccount, changePassword, publicUserFields, requestRegistration, reviewRegistration } from '@/lib/auth';
 import { createTask, editTask, listTasks, claimTask, withdrawTask, submitWork, reviewWork, reviewPublication, finishTask, settleReward, getTaskDetail, listRewards, getOverview } from '@/lib/tasks';
 import { downloadAttachment } from '@/lib/files';
 import { assertOrigin, ensure, AppError } from '@/lib/rules';
@@ -15,9 +15,9 @@ function setSession(response: NextResponse, token: string, maxAge: number) {
   response.cookies.set(SESSION_COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: process.env.COOKIE_SECURE === 'true', path: '/', maxAge });
   return response;
 }
-async function readBody(req: NextRequest) {
+async function readBody(req: NextRequest, maxBytes?: number) {
   const multipart = req.headers.get('content-type')?.startsWith('multipart/form-data');
-  const limit = multipart ? 101 * 1024 * 1024 : 1024 * 1024;
+  const limit = maxBytes ?? (multipart ? 101 * 1024 * 1024 : 1024 * 1024);
   ensure(Number(req.headers.get('content-length') ?? 0) <= limit, '请求过大，附件合计不得超过100MB', 413);
   const reader = req.body?.getReader(); const parts: Uint8Array[] = []; let length = 0;
   if (reader) {
@@ -46,10 +46,16 @@ async function handle(req: NextRequest, context: Context) {
     if (method === 'GET' && route === 'health') { await pool.query('SELECT 1'); return json({ ok: true }); }
     if (method !== 'GET') assertOrigin(req.headers.get('origin'), process.env.APP_ORIGIN ?? req.url);
     const token = req.cookies.get(SESSION_COOKIE)?.value;
+    const ip = process.env.TRUST_PROXY === 'true' ? req.headers.get('x-real-ip') ?? 'unknown' : 'direct';
+    if (method === 'POST' && route === 'auth/register') {
+      ensure(req.headers.get('content-type')?.startsWith('application/json'), '请提交 JSON 格式的注册申请', 415);
+      const { data } = await readBody(req, 4096);
+      await requestRegistration(pool, data, ip);
+      return json({ ok: true }, 201);
+    }
     if (method === 'POST' && route === 'auth/login') {
       const { data } = await readBody(req);
       const input = z.object({ username: z.string(), password: z.string() }).parse(data);
-      const ip = process.env.TRUST_PROXY === 'true' ? req.headers.get('x-real-ip') ?? 'unknown' : 'direct';
       const session = await login(pool, input.username, input.password, ip);
       return setSession(json({ user: session.user }), session.token, 7 * 86400);
     }
@@ -63,6 +69,13 @@ async function handle(req: NextRequest, context: Context) {
       return setSession(json({ ok: true }), '', 0);
     }
     ensure(!user.must_change_password, '请先修改初始密码', 403);
+    if (method === 'POST' && path[0] === 'registration-requests' && path[2] === 'review' && path.length === 3) {
+      ensure(user.role === 'admin', '仅管理员可以审核注册申请', 403);
+      const { data } = await readBody(req);
+      const { approve } = z.object({ approve: z.boolean() }).parse(data);
+      await reviewRegistration(pool, user, path[1], approve);
+      return json({ ok: true });
+    }
     if (method === 'GET' && route === 'overview') return json({ overview: await getOverview(pool, user) });
     if (method === 'GET' && route === 'tasks') {
       const p = req.nextUrl.searchParams;

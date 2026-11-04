@@ -14,7 +14,7 @@ import type { User } from '../src/lib/types';
 await mkdir('.data', { recursive: true });
 if (!existsSync('.env.local')) {
   const dbPassword = randomBytes(20).toString('hex'), adminPassword = randomBytes(12).toString('hex');
-  await writeFile('.env.local', `DATABASE_URL=postgres://postgres:${dbPassword}@127.0.0.1:54329/bounty\nLOCAL_DATABASE_PASSWORD=${dbPassword}\nAPP_ORIGIN=http://localhost:3000\nCOOKIE_SECURE=false\nTRUST_PROXY=false\nUPLOAD_DIR=.data/uploads\nADMIN_USERNAME=admin\nADMIN_PASSWORD=${adminPassword}\n`, { mode: 0o600, flag: 'wx' });
+  await writeFile('.env.local', `DATABASE_URL=postgres://postgres:${dbPassword}@127.0.0.1:54329/bounty\nLOCAL_DATABASE_PASSWORD=${dbPassword}\nAPP_ORIGIN=http://127.0.0.1:3000\nCOOKIE_SECURE=false\nTRUST_PROXY=false\nUPLOAD_DIR=.data/uploads\nADMIN_USERNAME=admin\nADMIN_PASSWORD=${adminPassword}\n`, { mode: 0o600, flag: 'wx' });
   await writeFile('.data/初始管理员.txt', `仅用于本地开发\n地址：http://localhost:3000\n账号：admin\n初始密码：${adminPassword}\n首次登录后必须修改密码。请勿将本文件上传到服务器或提交到版本库。\n`, { mode: 0o600, flag: 'wx' });
 }
 loadEnvFile('.env.local');

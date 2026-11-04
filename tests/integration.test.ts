@@ -7,7 +7,7 @@ import { readFile, writeFile, readdir, utimes, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { migrate, rows } from '../src/lib/db';
 import { createTask, claimTask, withdrawTask, submitWork, reviewWork, finishTask, settleReward, getTaskDetail, editTask, listTasks, reviewPublication } from '../src/lib/tasks';
-import { hashPassword, login, userForToken, changePassword, updateAccount, createAccount, removeAccount } from '../src/lib/auth';
+import { hashPassword, login, userForToken, changePassword, updateAccount, createAccount, removeAccount, requestRegistration, listRegistrationRequests, reviewRegistration } from '../src/lib/auth';
 import { saveAttachment, downloadAttachment, cleanupExpired, validateFiles } from '../src/lib/files';
 import { getWallet, recordPoints } from '../src/lib/wallet';
 import type { User } from '../src/lib/types';
@@ -30,7 +30,7 @@ beforeAll(async () => {
 });
 afterAll(async () => { await pool.end(); await postgres.stop(); });
 beforeEach(async () => {
-  await pool.query('TRUNCATE audit_log,attachments,rewards,submissions,claims,tasks,sessions,login_attempts,users RESTART IDENTITY CASCADE');
+  await pool.query('TRUNCATE registration_requests,audit_log,attachments,rewards,submissions,claims,tasks,sessions,login_attempts,users RESTART IDENTITY CASCADE');
   const users: User[] = [];
   for (const name of ['admin', 'publisher', 'worker', 'other', 'outsider']) {
     const id = randomUUID();
@@ -39,6 +39,34 @@ beforeEach(async () => {
   }
   [admin, publisher, worker, other, outsider] = users;
   await recordPoints(pool, publisher.id, 'fixture', 'legacy', 10000);
+});
+
+it('申请通过后才能以成员身份登录，且只能审批一次', async () => {
+  const application = { username: 'New.Member', name: '新成员', password: 'Test-password-2026', role: 'admin' };
+  await requestRegistration(pool, application, 'register');
+  await expect(requestRegistration(pool, application, 'register')).rejects.toMatchObject({ status: 409 });
+  await expect(login(pool, application.username, application.password, 'login')).rejects.toMatchObject({ status: 401 });
+  const [pending] = await listRegistrationRequests(pool);
+  expect(pending).toEqual({ id: expect.any(String), username: 'new.member', name: '新成员' });
+  await expect(reviewRegistration(pool, worker, pending.id, true)).rejects.toMatchObject({ status: 403 });
+  const results = await Promise.allSettled([
+    reviewRegistration(pool, admin, pending.id, true),
+    reviewRegistration(pool, admin, pending.id, true),
+  ]);
+  expect(results.map(result => result.status).sort()).toEqual(['fulfilled', 'rejected']);
+  const { user } = await login(pool, application.username, application.password, 'login');
+  expect(user).toMatchObject({ role: 'member', active: true, must_change_password: false });
+  expect(await listRegistrationRequests(pool)).toEqual([]);
+});
+
+it('拒绝申请后不会创建账号，并允许重新申请', async () => {
+  const application = { username: 'new.member', name: '新成员', password: 'Test-password-2026' };
+  await requestRegistration(pool, application, 'register');
+  const [pending] = await listRegistrationRequests(pool);
+  await reviewRegistration(pool, admin, pending.id, false);
+  await expect(login(pool, application.username, application.password, 'login')).rejects.toMatchObject({ status: 401 });
+  await requestRegistration(pool, application, 'register');
+  expect(await listRegistrationRequests(pool)).toHaveLength(1);
 });
 
 it('成员只能提交积分悬赏，退回重提后管理员须审核最新版本', async () => {

@@ -15,3 +15,4 @@ export type Attachment = { id: string; task_id: string; submission_id: string | 
 export type Reward = { id: string; task_id: string; title: string; user_id: string; name: string; reward_type: 'money' | 'points'; units: number; paid_at: string | null; created_at: string; publisher_id: string };
 export type TaskDetail = { task: Task; claims: Claim[]; submissions: Submission[]; attachments: Attachment[]; rewards: Reward[] };
 export type Overview = { open_tasks: number; completed_tasks: number; pending_reviews: number; points: number; total_money: number; pending_money: number };
+export type RegistrationRequest = { id: string; username: string; name: string };
