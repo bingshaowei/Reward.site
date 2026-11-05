@@ -30,6 +30,11 @@ async function balance(db: Db, userId: string, before: Date | null = null) {
   return Number(record.balance);
 }
 
+export async function hasUnlimitedPoints(db: Db, userId: string) {
+  const [user] = await rows<{ role: string }>(db, 'SELECT role FROM users WHERE id=$1', [userId]);
+  return user?.role === 'admin';
+}
+
 async function creditMonths(db: Db, userId: string, now: Date) {
   const months = await rows<{ month: string; due_at: Date }>(db, `
     WITH eligible AS (
@@ -110,6 +115,6 @@ export async function getWallet(pool: Pool, userId: string) {
       SELECT l.id::text,l.kind,l.amount::float8 AS amount,t.title,l.effective_at
       FROM wallet_ledger l LEFT JOIN tasks t ON t.id=l.task_id WHERE l.user_id=$1
       ORDER BY l.effective_at DESC,l.id DESC LIMIT 50`, [userId]);
-    return { balance: await balance(db, userId), reserved: Number(reserved.total), entries };
+    return { balance: await balance(db, userId), reserved: Number(reserved.total), unlimited: await hasUnlimitedPoints(db, userId), entries };
   });
 }

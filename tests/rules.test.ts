@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { toUnits, validateAllocation, expiryAt, assertOrigin, canReadAttachment } from '../src/lib/rules';
+import { toUnits, validateAllocation, expiryAt, assertOrigin, canReadAttachment, parseTaskDeadline } from '../src/lib/rules';
+
+describe('手填悬赏截止时间', () => {
+  it('留空时不限时，日期和时刻按北京时间解释', () => {
+    expect(parseTaskDeadline('  ')).toBeNull();
+    expect(parseTaskDeadline('2026-11-5 8:30')).toBe('2026-11-05T00:30:00.000Z');
+    expect(parseTaskDeadline('２０２６年１１月５日 １８：００')).toBe('2026-11-05T10:00:00.000Z');
+    expect(parseTaskDeadline('2028/2/29')).toBe('2028-02-29T15:59:59.999Z');
+  });
+
+  it('拒绝无效日期或时刻，避免自动滚动到其他日期', () => {
+    for (const value of ['2026-02-29', '2026-04-31', '2026-11-05 24:00', '2026-11-05 09:60', '尽快']) {
+      expect(() => parseTaskDeadline(value)).toThrow();
+    }
+  });
+});
 
 describe('奖励与访问规则', () => {
   it('金额精确转换为分，不接受超过两位小数、负数和指数写法', () => {

@@ -9,8 +9,8 @@ const chestStyles = [
   { name: '金冠宝箱', minimum: 1500 },
 ] as const;
 
-export function WalletChest({ balance }: { balance: number }) {
-  const tier = balance >= 1500 ? 3 : balance >= 500 ? 2 : balance >= 100 ? 1 : 0;
+export function WalletChest({ balance, unlimited }: { balance: number; unlimited: boolean }) {
+  const tier = unlimited || balance >= 1500 ? 3 : balance >= 500 ? 2 : balance >= 100 ? 1 : 0;
   const style = chestStyles[tier];
   const nextStyle = chestStyles[tier + 1];
   const host = useRef<HTMLDivElement>(null);

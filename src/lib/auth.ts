@@ -47,12 +47,12 @@ export async function login(pool: Pool, username: string, password: string, ip: 
   const { password_hash: _, ...user } = record;
   return transaction(pool, async db => {
     // 和重置/停用使用相同的行锁，避免并发重置后创建旧凭据会话。
-    const [current] = await rows(db, 'SELECT active,password_hash FROM users WHERE id=$1 FOR UPDATE', [user.id]);
+    const [current] = await rows(db, 'SELECT active,password_hash,role FROM users WHERE id=$1 FOR UPDATE', [user.id]);
     ensure(current.active && current.password_hash === record.password_hash, '账号状态已变更，请重新登录', 401);
     const token = randomBytes(32).toString('hex');
     await db.query("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,now()+interval '7 days')", [tokenHash(token), user.id]);
     await db.query('DELETE FROM login_attempts WHERE key=$1', [keys[0]]);
-    return { token, user: user as User };
+    return { token, user: { ...user, role: current.role } as User };
   });
 }
 export async function userForToken(db: Db, token: string | undefined | null): Promise<User | null> {
@@ -110,26 +110,46 @@ export async function reviewRegistration(pool: Pool, actor: User, id: string, ap
       [actor.id, approve ? 'registration.approve' : 'registration.reject', id]);
   });
 }
+async function lockManagedAccount(db: Db, actorId: string, id: string) {
+  // 按相同顺序锁定两个账号，避免管理员同时撤销对方权限。
+  const accounts = await rows<Pick<User, 'id' | 'role' | 'active'>>(db,
+    'SELECT id,role,active FROM users WHERE id IN ($1,$2) AND removed_at IS NULL ORDER BY id FOR UPDATE', [actorId, id]);
+  const actor = accounts.find(account => account.id === actorId);
+  ensure(actor?.active && actor.role === 'admin', '仅管理员可以管理账号', 403);
+  const target = accounts.find(account => account.id === id);
+  ensure(target, '账号不存在', 404);
+  return target;
+}
+
 export async function updateAccount(pool: Pool, actor: User, id: string, value: unknown) {
   ensure(actor.role === 'admin', '仅管理员可以管理账号', 403);
-  const input = z.object({ password: passwordInput.optional(), active: z.boolean().optional() }).parse(value);
-  ensure(input.password !== undefined || input.active !== undefined, '没有需要修改的内容');
+  const input = z.object({ password: passwordInput.optional(), active: z.boolean().optional(), role: z.enum(['admin', 'member']).optional() }).parse(value);
+  ensure(input.password !== undefined || input.active !== undefined || input.role !== undefined, '没有需要修改的内容');
   ensure(!(actor.id === id && input.active === false), '不能停用当前管理员账号');
+  ensure(!(actor.id === id && input.role === 'member'), '不能降低当前管理员账号的权限');
   const encoded = input.password ? await hashPassword(input.password) : null;
   await transaction(pool, async db => {
-    const [user] = await rows(db, 'SELECT id FROM users WHERE id=$1 AND removed_at IS NULL FOR UPDATE', [id]); ensure(user, '账号不存在', 404);
+    const user = await lockManagedAccount(db, actor.id, id);
+    const newRole = input.role !== user.role ? input.role : undefined;
+    if (!newRole && !encoded && input.active === undefined) return;
     await db.query(`UPDATE users SET password_hash=coalesce($2,password_hash), active=coalesce($3,active),
-      must_change_password=CASE WHEN $2::text IS NOT NULL THEN true ELSE must_change_password END WHERE id=$1`, [id, encoded, input.active ?? null]);
+      role=coalesce($4,role), must_change_password=CASE WHEN $2::text IS NOT NULL THEN true ELSE must_change_password END WHERE id=$1`,
+      [id, encoded, input.active ?? null, newRole ?? null]);
     await db.query('DELETE FROM sessions WHERE user_id=$1', [id]);
-    await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [actor.id, encoded ? 'account.reset-password' : 'account.status', id]);
+    if (newRole) {
+      await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [actor.id, newRole === 'admin' ? 'account.promote' : 'account.demote', id]);
+    }
+    if (encoded || input.active !== undefined) {
+      await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [actor.id, encoded ? 'account.reset-password' : 'account.status', id]);
+    }
   });
 }
 export async function removeAccount(pool: Pool, actor: User, id: string) {
   ensure(actor.role === 'admin', '仅管理员可以删除账号', 403);
   ensure(actor.id !== id, '不能删除当前管理员账号');
   await transaction(pool, async db => {
-    const result = await db.query('UPDATE users SET active=false,removed_at=now() WHERE id=$1 AND removed_at IS NULL', [id]);
-    ensure(result.rowCount, '账号不存在', 404);
+    await lockManagedAccount(db, actor.id, id);
+    await db.query('UPDATE users SET active=false,removed_at=now() WHERE id=$1', [id]);
     await db.query('DELETE FROM sessions WHERE user_id=$1', [id]);
     await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [actor.id, 'account.remove', id]);
   });

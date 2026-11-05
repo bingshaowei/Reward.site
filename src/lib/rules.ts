@@ -21,6 +21,20 @@ export function validateAllocation(value: Record<string, number>, members: strin
 export function expiryAt(endedAt: Date | string | null): Date | null {
   return endedAt ? new Date(new Date(endedAt).getTime() + 15 * 86400000) : null;
 }
+export function parseTaskDeadline(value: string): string | null {
+  const text = value.normalize('NFKC').trim();
+  if (!text) return null;
+  const normalized = text.replace(/年|月/g, '-').replace('日', ' ').trim();
+  const match = /^(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?:[ T]+(\d{1,2}):([0-5]\d))?$/.exec(normalized);
+  ensure(match, '请输入有效日期和时间，例如 2026-11-05 18:00');
+  const [, year, , month, day, hour, minute] = match;
+  const date = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+  const midnight = new Date(`${date}T00:00:00Z`);
+  ensure(year !== '0000' && Number.isFinite(+midnight) && midnight.toISOString().slice(0, 10) === date, '请输入有效的日期');
+  ensure(hour === undefined || Number(hour) < 24, '小时须为 0 至 23');
+  const time = hour === undefined ? '23:59:59.999' : `${hour.padStart(2, '0')}:${minute}:00`;
+  return new Date(`${date}T${time}+08:00`).toISOString();
+}
 export function assertOrigin(origin: string | null, expected: string) {
   ensure(origin && new URL(origin).origin === new URL(expected).origin, '请求来源无效，请从本站重新操作', 403);
 }

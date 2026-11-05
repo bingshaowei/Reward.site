@@ -12,12 +12,12 @@ export function PointsWallet({ wallet }: { wallet: Awaited<ReturnType<typeof get
     <div className="wallet-summary">
       <div>
         <h2 id="wallet-title">我的积分钱包</h2>
-        <p className="wallet-balance"><strong>{wallet.balance.toLocaleString('zh-CN')}</strong> 可用积分</p>
+        <p className="wallet-balance">{wallet.unlimited ? <strong>无限积分</strong> : <><strong>{wallet.balance.toLocaleString('zh-CN')}</strong> 可用积分</>}</p>
         <p>已预留 {wallet.reserved.toLocaleString('zh-CN')} 积分</p>
-        <p className="hint">每月发放 100 积分。月息 1%，按月初可用正余额计算，向下取整。</p>
-        {wallet.balance < 0 && <p className="hint overdue">后续积分到账会先抵扣欠额。</p>}
+        <p className="hint">{wallet.unlimited ? '管理员发布的积分悬赏由平台出资，个人积分流水仍会保留。' : '每月发放 100 积分。月息 1%，按月初可用正余额计算，向下取整。'}</p>
+        {!wallet.unlimited && wallet.balance < 0 && <p className="hint overdue">后续积分到账会先抵扣欠额。</p>}
       </div>
-      <WalletChest balance={wallet.balance} />
+      <WalletChest balance={wallet.balance} unlimited={wallet.unlimited} />
     </div>
     <details className="wallet-history">
       <summary>查看积分明细</summary>

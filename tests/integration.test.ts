@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { readFile, writeFile, readdir, utimes, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { migrate, rows } from '../src/lib/db';
-import { createTask, claimTask, withdrawTask, submitWork, reviewWork, finishTask, settleReward, getTaskDetail, editTask, listTasks, reviewPublication } from '../src/lib/tasks';
+import { createTask, claimTask, withdrawTask, submitWork, reviewWork, finishTask, settleReward, getTaskDetail, editTask, listTasks, reviewPublication, listPointsLeaders } from '../src/lib/tasks';
 import { hashPassword, login, userForToken, changePassword, updateAccount, createAccount, removeAccount, requestRegistration, listRegistrationRequests, reviewRegistration } from '../src/lib/auth';
 import { saveAttachment, downloadAttachment, cleanupExpired, validateFiles } from '../src/lib/files';
 import { getWallet, recordPoints } from '../src/lib/wallet';
@@ -92,16 +92,67 @@ it('成员只能提交积分悬赏，退回重提后管理员须审核最新版�
 });
 
 it('积分预留覆盖所有名额，部分验收后退回未发出的积分', async () => {
-  const task = await createTask(pool, admin, input({ capacity: 2, reward: '40', tags: ['分析', ' 脚本 '] }));
-  expect((await getWallet(pool, admin.id))).toMatchObject({ balance: 20, reserved: 80 });
-  await expect(createTask(pool, admin, input({ reward: '21' }))).rejects.toMatchObject({ status: 409 });
+  const task = await createTask(pool, other, input({ capacity: 2, reward: '40', tags: ['分析', ' 脚本 '] }));
+  expect(await getWallet(pool, other.id)).toMatchObject({ balance: 20, reserved: 80, unlimited: false });
+  await expect(createTask(pool, other, input({ reward: '21' }))).rejects.toMatchObject({ status: 409 });
+  await expect(editTask(pool, admin, task.id, input({ reward: '101' }))).rejects.toMatchObject({ status: 409 });
+  await reviewPublication(pool, admin, task.id, { approve: true, version: task.publication_version });
   expect((await listTasks(pool, { q: '脚本' }))[0].tags).toEqual(expect.arrayContaining(['分析', '脚本']));
   await claimTask(pool, worker, task.id);
   const submission = await submitWork(pool, worker, task.id, { content: '完成交付' });
   await reviewWork(pool, admin, submission.id, { approve: true });
   await finishTask(pool, admin, task.id, 'complete');
-  expect(await getWallet(pool, admin.id)).toMatchObject({ balance: 60, reserved: 0 });
+  expect(await getWallet(pool, other.id)).toMatchObject({ balance: 60, reserved: 0 });
   expect(await getWallet(pool, worker.id)).toMatchObject({ balance: 140, reserved: 0 });
+});
+
+it('管理员悬赏由平台发奖，降级后只影响后续发布和编辑', async () => {
+  const task = await createTask(pool, publisher, input({ reward: '50000' }));
+  const editable = await createTask(pool, publisher, input({ reward: '50000' }));
+  expect(await getWallet(pool, publisher.id)).toMatchObject({ unlimited: true, reserved: 0 });
+  await updateAccount(pool, admin, publisher.id, { role: 'member' });
+  expect(await getWallet(pool, publisher.id)).toMatchObject({ unlimited: false, reserved: 0 });
+  await expect(editTask(pool, admin, editable.id, input({ reward: '50000' }))).rejects.toMatchObject({ status: 409 });
+  await claimTask(pool, worker, task.id);
+  const submission = await submitWork(pool, worker, task.id, { content: '完成交付' });
+  await reviewWork(pool, admin, submission.id, { approve: true });
+  expect(await getWallet(pool, worker.id)).toMatchObject({ balance: 50100 });
+  expect((await getWallet(pool, publisher.id)).entries.every(entry => !['reserve', 'refund'].includes(entry.kind))).toBe(true);
+});
+
+it('成员升为管理员后，编辑悬赏退回原预留并切换为平台出资', async () => {
+  const task = await createTask(pool, worker, input({ reward: '80' }));
+  await updateAccount(pool, admin, worker.id, { role: 'admin' });
+  await editTask(pool, admin, task.id, input({ reward: '50000' }));
+  expect(await getWallet(pool, worker.id)).toMatchObject({ balance: 100, reserved: 0, unlimited: true });
+});
+
+it('推荐人选公开可见且不限制领取', async () => {
+  const task = await make({ assignment: { mode: 'recommended', memberIds: [worker.id] } });
+  expect((await getTaskDetail(pool, other, task.id)).recipients).toEqual([{ id: worker.id, name: worker.name }]);
+  await expect(claimTask(pool, other, task.id)).resolves.toMatchObject({ user_id: other.id });
+});
+
+it('仅指定对象可以抢名额，旧客户端编辑保留名单，首次领取后锁定', async () => {
+  const task = await make({ assignment: { mode: 'assigned', memberIds: [worker.id, other.id] } });
+  await editTask(pool, publisher, task.id, input({ reward: '80' }));
+  expect((await getTaskDetail(pool, publisher, task.id)).recipients.map(member => member.id)).toEqual([other.id, worker.id]);
+  expect(await getTaskDetail(pool, worker, task.id)).toMatchObject({ recipients: [], task: { assignment_mode: 'assigned', selected_for_viewer: true } });
+  expect((await listTasks(pool, { userId: worker.id }))[0]).toMatchObject({ selected_for_viewer: true });
+  await expect(claimTask(pool, outsider, task.id)).rejects.toMatchObject({ status: 403 });
+  const claims = await Promise.allSettled([claimTask(pool, worker, task.id), claimTask(pool, other, task.id)]);
+  expect(claims.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+  await expect(editTask(pool, publisher, task.id, input({ assignment: { mode: 'public', memberIds: [] } }))).rejects.toThrow('已锁定');
+});
+
+it('拒绝空名单、重复、停用、发布者本人和过多指定名额', async () => {
+  await updateAccount(pool, admin, outsider.id, { active: false });
+  for (const memberIds of [[], [worker.id, worker.id], [outsider.id], [publisher.id], ['missing']]) {
+    await expect(make({ assignment: { mode: 'assigned', memberIds } })).rejects.toThrow();
+  }
+  await expect(make({ capacity: 2, assignment: { mode: 'assigned', memberIds: [worker.id] } })).rejects.toThrow('指定人数');
+  const task = await make();
+  expect((await getTaskDetail(pool, worker, task.id)).task.assignment_mode).toBe('public');
 });
 
 it('满五天退出扣25分，逾期一天另扣10分，重复结算不重扣', async () => {
@@ -161,6 +212,42 @@ it('仅管理员可删除账号，删除撤销会话并保留任务记录', asyn
 });
 
 describe('真实 PostgreSQL 任务和奖励流程', () => {
+  it('积分榜显示十位成员，并在截取处稳定排序', async () => {
+    const task = await make();
+    await pool.query(`WITH entrants AS (
+      INSERT INTO users(id,username,name,password_hash,role)
+      SELECT 'rank-'||n,'rank-'||n,'同分成员',$1,'member'
+      FROM generate_series(10,21) n RETURNING id
+    ), entries AS (
+      INSERT INTO claims(id,task_id,user_id,status)
+      SELECT 'claim-'||id,$2,id,'accepted' FROM entrants RETURNING id,user_id
+    )
+    INSERT INTO rewards(id,task_id,claim_id,user_id,reward_type,units)
+    SELECT 'reward-'||id,$2,id,user_id,'points',10 FROM entries`, [passwordHash, task.id]);
+    const leaders = await listPointsLeaders(pool);
+    expect(leaders.map(({ id, rank }) => [id, rank])).toEqual(
+      Array.from({ length: 10 }, (_, index) => [`rank-${index + 10}`, 1]),
+    );
+  });
+  it('积分榜累计已验收奖励、同分并列并排除停用成员和金额奖励', async () => {
+    async function award(member: User, reward: string, reward_type = 'points') {
+      const task = await make({ reward, reward_type });
+      await claimTask(pool, member, task.id);
+      const submission = await submitWork(pool, member, task.id, { content: '完成交付' });
+      await reviewWork(pool, publisher, submission.id, { approve: true });
+    }
+    await award(worker, '40');
+    await award(worker, '60');
+    await award(other, '100');
+    await award(outsider, '200');
+    await award(admin, '300', 'money');
+    expect((await listPointsLeaders(pool)).map(({ rank, points }) => [rank, points])).toEqual([[1, 200], [2, 100], [2, 100]]);
+    await updateAccount(pool, admin, outsider.id, { active: false });
+    expect((await listPointsLeaders(pool)).map(({ id, rank, points }) => [id, rank, points])).toEqual([
+      [other.id, 1, 100], [worker.id, 1, 100],
+    ]);
+  });
+
   it('并发领取最后一个名额只能成功一次，且不能领取自己的任务', async () => {
     const task = await make();
     await expect(claimTask(pool, publisher, task.id)).rejects.toThrow();
@@ -242,6 +329,28 @@ describe('真实 PostgreSQL 任务和奖励流程', () => {
 });
 
 describe('账号与会话', () => {
+  it('仅管理员可变更他人角色，升降级均撤销旧会话', async () => {
+    await expect(updateAccount(pool, worker, other.id, { role: 'admin' })).rejects.toMatchObject({ status: 403 });
+    await expect(updateAccount(pool, admin, admin.id, { role: 'member' })).rejects.toThrow();
+    const memberSession = await login(pool, worker.username, 'Test-password-2026', 'role-test');
+    await updateAccount(pool, admin, worker.id, { role: 'admin' });
+    expect(await userForToken(pool, memberSession.token)).toBeNull();
+    const adminSession = await login(pool, worker.username, 'Test-password-2026', 'role-test');
+    expect(adminSession.user.role).toBe('admin');
+    await updateAccount(pool, admin, worker.id, { role: 'member' });
+    expect(await userForToken(pool, adminSession.token)).toBeNull();
+    expect((await login(pool, worker.username, 'Test-password-2026', 'role-test')).user.role).toBe('member');
+  });
+
+  it('并发互相降级时至少保留一名管理员', async () => {
+    const results = await Promise.allSettled([
+      updateAccount(pool, admin, publisher.id, { role: 'member' }),
+      updateAccount(pool, publisher, admin.id, { role: 'member' }),
+    ]);
+    expect(results.map(result => result.status).sort()).toEqual(['fulfilled', 'rejected']);
+    expect(await rows(pool, "SELECT id FROM users WHERE role='admin' AND active")).toHaveLength(1);
+  });
+
   it('错误密码不能登录，退出、重置和停用能立即使会话失效', async () => {
     await expect(login(pool, 'worker', 'wrong-password', 'test')).rejects.toThrow();
     const session = await login(pool, 'worker', 'Test-password-2026', 'test');

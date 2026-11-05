@@ -22,6 +22,7 @@ const serve = process.argv.includes('--serve');
 if (serve) {
   if (!existsSync('.next/standalone/server.js')) throw new Error('请先运行 npm run build，再启动本地生产预览。');
   await cp('.next/static', '.next/standalone/.next/static', { recursive: true });
+  await cp('public', '.next/standalone/public', { recursive: true });
 }
 const url = new URL(process.env.DATABASE_URL!);
 if (url.hostname !== '127.0.0.1' || url.port !== '54329' || !process.env.LOCAL_DATABASE_PASSWORD) throw new Error('dev:local 仅用于本地内嵌数据库。外部数据库请使用 npm run dev。');

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z, ZodError } from 'zod';
 import { getPool, rows } from '@/lib/db';
 import { login, logout, userForToken, createAccount, updateAccount, removeAccount, changePassword, publicUserFields, requestRegistration, reviewRegistration } from '@/lib/auth';
-import { createTask, editTask, listTasks, claimTask, withdrawTask, submitWork, reviewWork, reviewPublication, finishTask, settleReward, getTaskDetail, listRewards, getOverview } from '@/lib/tasks';
+import { createTask, editTask, listTasks, claimTask, withdrawTask, submitWork, reviewWork, reviewPublication, finishTask, settleReward, getTaskDetail, listRewards, getOverview, listPointsLeaders } from '@/lib/tasks';
 import { downloadAttachment } from '@/lib/files';
 import { assertOrigin, ensure, AppError } from '@/lib/rules';
 import { SESSION_COOKIE } from '@/lib/server';
@@ -77,6 +77,7 @@ async function handle(req: NextRequest, context: Context) {
       return json({ ok: true });
     }
     if (method === 'GET' && route === 'overview') return json({ overview: await getOverview(pool, user) });
+    if (method === 'GET' && route === 'points-leaderboard') return json({ leaders: await listPointsLeaders(pool) });
     if (method === 'GET' && route === 'tasks') {
       const p = req.nextUrl.searchParams;
       return json({ tasks: await listTasks(pool, { q: p.get('q') ?? '', status: p.get('status') ?? '', reward: p.get('reward') ?? '', mine: p.get('mine') ?? '', userId: user.id }) });

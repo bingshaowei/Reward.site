@@ -1,5 +1,6 @@
 'use client';
 import { useState } from 'react';
+import Image from 'next/image';
 import { ArrowRight, Eye, EyeOff, LockKeyhole, Users, Coins } from 'lucide-react';
 import { api } from '@/lib/client';
 import type { User } from '@/lib/types';
@@ -29,7 +30,10 @@ export function LoginForm() {
     catch (e) { setError((e as Error).message); setBusy(false); }
   }
   return <main className="login-page">
-    <div className="login-brand"><span className="seal">赏</span><strong>内部悬赏令</strong><span className="brand-sub">CCP 团队工作协作平台</span></div>
+    <header className="login-header">
+      <div className="login-brand"><span className="seal">赏</span><strong>内部悬赏令</strong><span className="brand-sub">CCP 团队工作协作平台</span></div>
+      <Image className="login-logo" src="/logo-full.svg" alt="团队标识" width={224} height={68} unoptimized loading="eager" />
+    </header>
     <section className="login-content">
       <div className="login-story"><span className="eyebrow">好工作，值得一起完成</span><h1>把工作写下来，<br />让本事<span>有回报。</span></h1><p>发布一份悬赏，找到合适的伙伴。<br />从领取到交付，让每一份付出都有记录。</p><div className="login-features"><span><Users size={18} /> 单人承接 / 团队协作</span><span><Coins size={18} /> 金额悬赏 / 积分奖励</span></div><div className="poster-stamp" aria-hidden="true"><span>内部协作</span><strong>悬赏令</strong><span>有能者 · 一起来</span></div></div>
       <div className="login-card paper"><div className="card-tape" aria-hidden="true" /><span className="eyebrow">{registering ? '加入团队' : '欢迎回来'}</span><h2>{registering ? '申请注册' : '登录工作台'}</h2><p className="muted">{registering ? '提交申请后，管理员审核通过即可登录。' : '使用你的内部账号登录。'}</p>
