@@ -21,19 +21,20 @@ export function validateAllocation(value: Record<string, number>, members: strin
 export function expiryAt(endedAt: Date | string | null): Date | null {
   return endedAt ? new Date(new Date(endedAt).getTime() + 15 * 86400000) : null;
 }
-export function parseTaskDeadline(value: string): string | null {
-  const text = value.normalize('NFKC').trim();
-  if (!text) return null;
-  const normalized = text.replace(/年|月/g, '-').replace('日', ' ').trim();
-  const match = /^(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?:[ T]+(\d{1,2}):([0-5]\d))?$/.exec(normalized);
-  ensure(match, '请输入有效日期和时间，例如 2026-11-05 18:00');
-  const [, year, , month, day, hour, minute] = match;
-  const date = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+export type DeadlineFields = { year: string; month: string; day: string; time: string };
+export function parseTaskDeadline(fields: DeadlineFields): string | null {
+  const [year, month, day, time] = [fields.year, fields.month, fields.day, fields.time]
+    .map(value => value.normalize('NFKC').trim());
+  if (!year && !month && !day && !time) return null;
+  ensure(/^\d{4}$/.test(year) && year !== '0000' && /^\d{1,2}$/.test(month) && Number(month) >= 1 && Number(month) <= 12, '请输入四位年份和有效月份');
+  ensure(!time || day, '填写时间时也需要填写日期');
+  ensure(!day || /^\d{1,2}$/.test(day), '请输入有效的日期');
+  const date = `${year}-${month.padStart(2, '0')}-${(day || '1').padStart(2, '0')}`;
   const midnight = new Date(`${date}T00:00:00Z`);
-  ensure(year !== '0000' && Number.isFinite(+midnight) && midnight.toISOString().slice(0, 10) === date, '请输入有效的日期');
-  ensure(hour === undefined || Number(hour) < 24, '小时须为 0 至 23');
-  const time = hour === undefined ? '23:59:59.999' : `${hour.padStart(2, '0')}:${minute}:00`;
-  return new Date(`${date}T${time}+08:00`).toISOString();
+  ensure(Number.isFinite(+midnight) && midnight.toISOString().slice(0, 10) === date, '请输入有效的日期');
+  ensure(!time || /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time), '请输入有效的时间');
+  const clock = time ? `${time}:00` : day ? '23:59:59.999' : '00:00:00';
+  return new Date(`${date}T${clock}+08:00`).toISOString();
 }
 export function assertOrigin(origin: string | null, expected: string) {
   ensure(origin && new URL(origin).origin === new URL(expected).origin, '请求来源无效，请从本站重新操作', 403);

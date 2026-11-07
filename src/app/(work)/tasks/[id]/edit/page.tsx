@@ -13,5 +13,5 @@ export default async function EditTask({ params }: { params: Promise<{ id: strin
   const [tags, wallet, recipientOptions] = await Promise.all([
     listTags(pool), getWallet(pool, publisherId), listRecipientOptions(pool, publisherId),
   ]);
-  return <TaskForm initial={serializable(detail.task)} canPublishMoney={user.role === 'admin' && detail.task.publication_status === 'approved'} availableTags={tags} walletBalance={wallet.balance} platformFunded={wallet.unlimited} recipientOptions={recipientOptions} initialRecipients={detail.recipients} />;
+  return <TaskForm initial={serializable(detail.task)} canPublishMoney={user.role === 'admin' && detail.task.publication_status === 'approved'} availableTags={tags} walletBalance={wallet.balance} platformFunded={wallet.unlimited} recipientOptions={recipientOptions} initialRecipients={detail.recipients} initialReferences={detail.references} />;
 }

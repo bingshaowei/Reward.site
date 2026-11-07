@@ -1,7 +1,7 @@
 'use client';
 import { useState } from 'react';
 import { UserPlus, KeyRound, ShieldCheck, Eye, EyeOff } from 'lucide-react';
-import { api } from '@/lib/client';
+import { api, pendingReviewsChanged } from '@/lib/client';
 import Link from 'next/link';
 import type { RegistrationRequest, Task, User } from '@/lib/types';
 export function Admin({ user, initial, pendingTasks, registrationRequests }: { user: User; initial: User[]; pendingTasks: Task[]; registrationRequests: RegistrationRequest[] }) {
@@ -21,6 +21,7 @@ export function Admin({ user, initial, pendingTasks, registrationRequests }: { u
     await run(async () => {
       await api(`registration-requests/${application.id}/review`, { method: 'POST', body: JSON.stringify({ approve }) });
       setApplications(current => current.filter(item => item.id !== application.id));
+      window.dispatchEvent(new Event(pendingReviewsChanged));
     }, approve ? '注册申请已通过，成员现在可以登录。' : '注册申请已拒绝。');
   }
   const registrationQueue = <section className="paper detail-section">

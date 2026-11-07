@@ -74,7 +74,7 @@ export async function downloadAttachment(db: Db, user: User, id: string) {
   const [a] = await rows(db, `SELECT a.*,t.publisher_id,t.ended_at,t.publication_status,
     coalesce((SELECT array_agg(c.user_id) FROM claims c JOIN submissions s ON s.task_id=c.task_id
     WHERE s.id=a.submission_id AND (s.claim_id IS NULL OR c.id=s.claim_id) AND c.status<>'withdrawn'),ARRAY[]::text[]) AS participant_ids
-    FROM attachments a JOIN tasks t ON t.id=a.task_id WHERE a.id=$1`, [id]);
+    FROM attachments a JOIN tasks t ON t.id=a.task_id WHERE a.id=$1 AND t.removed_at IS NULL`, [id]);
   ensure(a, '附件不存在', 404); ensure(canReadAttachment(user, a as Parameters<typeof canReadAttachment>[1]), '没有权限下载这个附件', 403);
   ensure(a.publication_status === 'approved' || a.publisher_id === user.id || user.role === 'admin', '附件不存在', 404);
   const expiry = expiryAt(a.ended_at);

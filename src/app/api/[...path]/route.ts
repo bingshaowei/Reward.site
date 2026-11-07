@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z, ZodError } from 'zod';
 import { getPool, rows } from '@/lib/db';
 import { login, logout, userForToken, createAccount, updateAccount, removeAccount, changePassword, publicUserFields, requestRegistration, reviewRegistration } from '@/lib/auth';
-import { createTask, editTask, listTasks, claimTask, withdrawTask, submitWork, reviewWork, reviewPublication, finishTask, settleReward, getTaskDetail, listRewards, getOverview, listPointsLeaders } from '@/lib/tasks';
+import { createTask, editTask, listTasks, claimTask, withdrawTask, submitWork, reviewWork, reviewPublication, finishTask, settleReward, getTaskDetail, listRewards, getOverview, listPointsLeaders, removeCompletedTask, searchTaskReferences, setRewardVote, getPendingReviews } from '@/lib/tasks';
 import { downloadAttachment } from '@/lib/files';
 import { assertOrigin, ensure, AppError } from '@/lib/rules';
 import { SESSION_COOKIE } from '@/lib/server';
+import { readAvatar, updateAvatar } from '@/lib/avatars';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -62,6 +63,15 @@ async function handle(req: NextRequest, context: Context) {
     const user = await userForToken(pool, token); ensure(user, '登录已失效，请重新登录', 401);
     if (method === 'POST' && route === 'auth/logout') { await logout(pool, token); return setSession(json({ ok: true }), '', 0); }
     if (method === 'GET' && route === 'me') return json({ user });
+    if (method === 'GET' && route === 'me/avatar') {
+      const avatar = await readAvatar(pool, user.id);
+      ensure(avatar, '尚未设置头像', 404);
+      return new NextResponse(new Uint8Array(avatar.data), { headers: { 'Content-Type': avatar.type, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' } });
+    }
+    if (method === 'POST' && route === 'me/avatar') {
+      const { data } = await readBody(req, 720000);
+      return json({ version: await updateAvatar(pool, user, data) });
+    }
     if (method === 'POST' && route === 'me/password') {
       const { data } = await readBody(req);
       const input = z.object({ oldPassword: z.string(), newPassword: z.string() }).parse(data);
@@ -77,6 +87,11 @@ async function handle(req: NextRequest, context: Context) {
       return json({ ok: true });
     }
     if (method === 'GET' && route === 'overview') return json({ overview: await getOverview(pool, user) });
+    if (method === 'GET' && route === 'admin/pending-reviews') {
+      ensure(user.role === 'admin', '仅管理员可以查看待审核数量', 403);
+      return json(await getPendingReviews(pool));
+    }
+    if (method === 'GET' && route === 'tasks/reference-search') return json({ references: await searchTaskReferences(pool, req.nextUrl.searchParams.get('q') ?? '') });
     if (method === 'GET' && route === 'points-leaderboard') return json({ leaders: await listPointsLeaders(pool) });
     if (method === 'GET' && route === 'tasks') {
       const p = req.nextUrl.searchParams;
@@ -89,9 +104,11 @@ async function handle(req: NextRequest, context: Context) {
     if (path[0] === 'tasks' && path.length === 2) {
       if (method === 'GET') return json(await getTaskDetail(pool, user, path[1]));
       if (method === 'PATCH') { const { data } = await readBody(req); await editTask(pool, user, path[1], data); return json({ ok: true }); }
+      if (method === 'DELETE') { await removeCompletedTask(pool, user, path[1]); return json({ ok: true }); }
     }
     if (method === 'POST' && path[0] === 'tasks' && path.length === 3) {
       const id = path[1], action = path[2];
+      if (action === 'reward-feedback') { const { data } = await readBody(req); return json(await setRewardVote(pool, user, id, data)); }
       if (action === 'publication-review') { const { data } = await readBody(req); await reviewPublication(pool, user, id, data); return json({ ok: true }); }
       if (action === 'claim') return json({ claim: await claimTask(pool, user, id) });
       if (action === 'withdraw') { await withdrawTask(pool, user, id); return json({ ok: true }); }

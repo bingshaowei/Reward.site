@@ -1,3 +1,4 @@
+export const pendingReviewsChanged = 'pending-reviews-changed';
 export async function api<T = { ok: boolean }>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api/${url}`, { ...options, headers: { ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...options.headers } });
   const result = await response.json();

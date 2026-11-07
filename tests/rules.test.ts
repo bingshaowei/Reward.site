@@ -2,15 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { toUnits, validateAllocation, expiryAt, assertOrigin, canReadAttachment, parseTaskDeadline } from '../src/lib/rules';
 
 describe('手填悬赏截止时间', () => {
+  const fields = (year = '', month = '', day = '', time = '') => ({ year, month, day, time });
   it('留空时不限时，日期和时刻按北京时间解释', () => {
-    expect(parseTaskDeadline('  ')).toBeNull();
-    expect(parseTaskDeadline('2026-11-5 8:30')).toBe('2026-11-05T00:30:00.000Z');
-    expect(parseTaskDeadline('２０２６年１１月５日 １８：００')).toBe('2026-11-05T10:00:00.000Z');
-    expect(parseTaskDeadline('2028/2/29')).toBe('2028-02-29T15:59:59.999Z');
+    expect(parseTaskDeadline(fields())).toBeNull();
+    expect(parseTaskDeadline(fields('2026', '11', '5', '08:30'))).toBe('2026-11-05T00:30:00.000Z');
+    expect(parseTaskDeadline(fields('２０２６', '１１', '５', '１８：００'))).toBe('2026-11-05T10:00:00.000Z');
+    expect(parseTaskDeadline(fields('2028', '2', '29'))).toBe('2028-02-29T15:59:59.999Z');
+    expect(parseTaskDeadline(fields('2026', '12'))).toBe('2026-11-30T16:00:00.000Z');
+    expect(parseTaskDeadline(fields('2027', '1'))).toBe('2026-12-31T16:00:00.000Z');
   });
 
   it('拒绝无效日期或时刻，避免自动滚动到其他日期', () => {
-    for (const value of ['2026-02-29', '2026-04-31', '2026-11-05 24:00', '2026-11-05 09:60', '尽快']) {
+    for (const value of [fields('2026', '2', '29'), fields('2026', '4', '31'), fields('2026', '11', '5', '24:00'), fields('2026', '11', '5', '09:60'), fields('2026', '11', '', '18:00'), fields('2026')]) {
       expect(() => parseTaskDeadline(value)).toThrow();
     }
   });

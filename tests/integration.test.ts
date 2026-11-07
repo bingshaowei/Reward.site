@@ -12,6 +12,7 @@ import { saveAttachment, downloadAttachment, cleanupExpired, validateFiles } fro
 import { getWallet, recordPoints } from '../src/lib/wallet';
 import type { User } from '../src/lib/types';
 import * as taskService from '../src/lib/tasks';
+import * as avatarService from '../src/lib/avatars';
 
 const postgres = new EmbeddedPostgres({ databaseDir: '.data/test-postgres', user: 'postgres', password: 'test-only-password', port: 55439, persistent: true, autoRehydrateSymlinks: true, postgresFlags: ['-h', '127.0.0.1'], onLog: () => {}, onError: () => {} });
 const pool = new Pool({ connectionString: 'postgres://postgres:test-only-password@127.0.0.1:55439/postgres', max: 10 });
@@ -39,6 +40,83 @@ beforeEach(async () => {
   }
   [admin, publisher, worker, other, outsider] = users;
   await recordPoints(pool, publisher.id, 'fixture', 'legacy', 10000);
+});
+
+it('头像只更新当前成员，替换后持久保存且会话保持有效', async () => {
+  const image = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=';
+  const session = await login(pool, worker.username, 'Test-password-2026', 'avatar');
+  const version = await avatarService.updateAvatar(pool, worker, { image });
+  expect(await avatarService.readAvatar(pool, worker.id)).toMatchObject({ type: 'image/png', data: Buffer.from(image.split(',')[1], 'base64') });
+  expect(await avatarService.readAvatar(pool, other.id)).toBeNull();
+  expect(await userForToken(pool, session.token)).toMatchObject({ id: worker.id, avatar_version: version });
+  expect(await avatarService.updateAvatar(pool, worker, { image })).not.toBe(version);
+});
+
+it('头像拒绝伪装图片、无效格式及超大内容，保留原头像', async () => {
+  for (const image of ['data:image/svg+xml;base64,PHN2Zz4=', 'data:image/png;base64,aGVsbG8=', `data:image/png;base64,${'A'.repeat(800000)}`]) {
+    await expect(avatarService.updateAvatar(pool, worker, { image })).rejects.toThrow();
+  }
+  expect(await avatarService.readAvatar(pool, worker.id)).toBeNull();
+});
+
+it('团队协作至少设置两个名额', async () => {
+  await expect(make({ mode: 'team', capacity: 1 })).rejects.toThrow('团队至少设置2个名额');
+  expect(await make({ mode: 'team', capacity: 2 })).toMatchObject({ mode: 'team', capacity: 2 });
+});
+
+it('仅管理员可以删除已完成悬赏，奖励、积分流水与榜单仍保留', async () => {
+  const task = await createTask(pool, publisher, input({ title: '历史归档测试' }), [zip()]);
+  await expect(taskService.removeCompletedTask(pool, admin, task.id)).rejects.toMatchObject({ status: 409 });
+  const detail = await getTaskDetail(pool, publisher, task.id);
+  await claimTask(pool, worker, task.id);
+  const submission = await submitWork(pool, worker, task.id, { content: '已完成归档' });
+  await reviewWork(pool, publisher, submission.id, { approve: true });
+  await expect(taskService.removeCompletedTask(pool, worker, task.id)).rejects.toMatchObject({ status: 403 });
+  await taskService.removeCompletedTask(pool, admin, task.id);
+  await expect(getTaskDetail(pool, admin, task.id)).rejects.toMatchObject({ status: 404 });
+  await expect(downloadAttachment(pool, worker, detail.attachments[0].id)).rejects.toMatchObject({ status: 404 });
+  expect(await listTasks(pool, { status: 'completed' })).toEqual([]);
+  expect(await taskService.listRewards(pool, worker)).toEqual([expect.objectContaining({ units: 100, task_removed: true })]);
+  expect((await getWallet(pool, worker.id)).entries).toContainEqual(expect.objectContaining({ kind: 'reward', amount: 100 }));
+  expect(await listPointsLeaders(pool)).toContainEqual(expect.objectContaining({ id: worker.id, points: 100 }));
+});
+
+it('搜索并关联可见的已完成任务，删除后从搜索与引用中隐藏', async () => {
+  const reference = await make({ title: '实验报告汇总' });
+  const unfinished = await make({ title: '实验报告初稿' });
+  await finishTask(pool, publisher, reference.id, 'complete');
+  expect(await taskService.searchTaskReferences(pool, '实验报告')).toEqual([{ id: reference.id, title: reference.title }]);
+  await expect(make({ referenceIds: [unfinished.id] })).rejects.toThrow('已完成');
+  const task = await make({ referenceIds: [reference.id] });
+  await editTask(pool, publisher, task.id, input({}));
+  expect((await getTaskDetail(pool, worker, task.id)).references).toEqual([{ id: reference.id, title: reference.title }]);
+  await taskService.removeCompletedTask(pool, admin, reference.id);
+  expect(await taskService.searchTaskReferences(pool, '实验报告')).toEqual([]);
+  expect((await getTaskDetail(pool, worker, task.id)).references).toEqual([]);
+});
+
+it('奖励反馈每人一票，可改选或撤回，只有发布者能看汇总', async () => {
+  const task = await make();
+  await expect(taskService.setRewardVote(pool, publisher, task.id, { vote: 'high' })).rejects.toMatchObject({ status: 403 });
+  await taskService.setRewardVote(pool, worker, task.id, { vote: 'low' });
+  await taskService.setRewardVote(pool, worker, task.id, { vote: 'high' });
+  await taskService.setRewardVote(pool, other, task.id, { vote: 'low' });
+  expect((await listTasks(pool, { userId: worker.id }))[0]).toMatchObject({ reward_vote: 'high', low_votes: null, high_votes: null });
+  expect((await getTaskDetail(pool, publisher, task.id)).task).toMatchObject({ low_votes: 1, high_votes: 1 });
+  await taskService.setRewardVote(pool, worker, task.id, { vote: null });
+  expect((await getTaskDetail(pool, publisher, task.id)).task).toMatchObject({ low_votes: 1, high_votes: 0 });
+  await finishTask(pool, publisher, task.id, 'complete');
+  await expect(taskService.setRewardVote(pool, worker, task.id, { vote: 'high' })).rejects.toThrow('结束');
+});
+
+it('待审核数量分别统计悬赏与注册，审核后归零', async () => {
+  const task = await createTask(pool, worker, input({ reward: '1' }));
+  await requestRegistration(pool, { username: 'badge.member', name: '待审核成员', password: 'Test-password-2026' }, 'badge-register');
+  expect(await taskService.getPendingReviews(pool)).toEqual({ tasks: 1, registrations: 1 });
+  await reviewPublication(pool, admin, task.id, { approve: true, version: task.publication_version });
+  const [request] = await listRegistrationRequests(pool);
+  await reviewRegistration(pool, admin, request.id, false);
+  expect(await taskService.getPendingReviews(pool)).toEqual({ tasks: 0, registrations: 0 });
 });
 
 it('申请通过后才能以成员身份登录，且只能审批一次', async () => {

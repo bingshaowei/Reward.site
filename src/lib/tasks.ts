@@ -5,7 +5,7 @@ import { rows, transaction, type Db } from './db';
 import { ensure, toUnits, validateAllocation } from './rules';
 import { saveAttachment, validateFiles, uploadTransaction } from './files';
 import { adjustReserve, chargeOverdue, chargeWithdrawal, hasUnlimitedPoints, lockWallet, recordPoints } from './wallet';
-import type { User, Task, TaskDetail, Claim, Submission, Reward, Attachment, Overview, PointsLeader, RecipientOption, TaskRecipient } from './types';
+import type { User, Task, TaskDetail, Claim, Submission, Reward, Attachment, Overview, PointsLeader, RecipientOption, TaskRecipient, TaskReference, PendingReviews } from './types';
 
 const assignmentInput = z.object({
   mode: z.enum(['public', 'recommended', 'assigned']),
@@ -18,7 +18,24 @@ const taskInput = z.object({
   capacity: z.number().int().min(1).max(100), deadline: z.string().datetime({ offset: true }).nullable().optional(),
   tags: z.array(z.string().trim().min(1).max(24)).max(8).default([]),
   assignment: assignmentInput.optional(),
-});
+  referenceIds: z.array(z.string().min(1).max(100)).max(5).optional(),
+}).refine(data => data.mode !== 'team' || data.capacity >= 2, { message: '团队至少设置2个名额', path: ['capacity'] });
+const visibleCompleted = "t.status='completed' AND t.publication_status='approved' AND t.removed_at IS NULL";
+export function searchTaskReferences(db: Db, query: string) {
+  return rows<TaskReference>(db, `SELECT t.id,t.title FROM tasks t WHERE ${visibleCompleted}
+    AND ($1='' OR strpos(lower(t.title),lower($1))>0 OR strpos(lower(t.description),lower($1))>0
+      OR EXISTS (SELECT 1 FROM task_tags WHERE task_id=t.id AND strpos(lower(tag_name),lower($1))>0))
+    ORDER BY t.ended_at DESC NULLS LAST,t.id LIMIT 12`, [query.trim().slice(0, 100)]);
+}
+async function saveReferences(db: Db, taskId: string, referenceIds: string[]) {
+  ensure(new Set(referenceIds).size === referenceIds.length && !referenceIds.includes(taskId), '请勿重复关联或关联悬赏本身');
+  if (referenceIds.length) {
+    const matches = await rows(db, `SELECT t.id FROM tasks t WHERE ${visibleCompleted} AND t.id=ANY($1::text[]) FOR SHARE`, [referenceIds]);
+    ensure(matches.length === referenceIds.length, '只能关联仍可查看的已完成悬赏');
+  }
+  await db.query('DELETE FROM task_references WHERE task_id=$1', [taskId]);
+  if (referenceIds.length) await db.query('INSERT INTO task_references(task_id,reference_id) SELECT $1,unnest($2::text[])', [taskId, referenceIds]);
+}
 async function rewardReserve(db: Db, publisherId: string, data: z.infer<typeof taskInput>, amount: number) {
   if (data.reward_type !== 'points' || await hasUnlimitedPoints(db, publisherId)) return 0;
   return amount * (data.mode === 'team' ? 1 : data.capacity);
@@ -54,7 +71,7 @@ export async function audit(db: Db, userId: string, action: string, targetId: st
   await db.query('INSERT INTO audit_log(actor_id,action,target_id) VALUES($1,$2,$3)', [userId, action, targetId]);
 }
 async function lockTask(db: PoolClient, id: string) {
-  const [task] = await rows<Task>(db, 'SELECT * FROM tasks WHERE id=$1 FOR UPDATE', [id]);
+  const [task] = await rows<Task>(db, 'SELECT * FROM tasks WHERE id=$1 AND removed_at IS NULL FOR UPDATE', [id]);
   ensure(task, '任务不存在', 404); return task;
 }
 function owner(task: Task, user: User) { ensure(user.id === task.publisher_id || user.role === 'admin', '仅发布者或管理员可以操作', 403); }
@@ -70,6 +87,7 @@ export async function createTask(pool: Pool, user: User, value: unknown, files: 
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
     [randomUUID(), user.id, data.title, data.description, data.criteria, data.mode, data.reward_type, amount, data.capacity, data.deadline ?? null, user.role === 'admin' ? 'approved' : 'pending', data.assignment?.mode ?? 'public']);
     if (data.assignment) await saveRecipients(db, task, data.assignment, data.capacity);
+    if (data.referenceIds?.length) await saveReferences(db, task.id, data.referenceIds);
     await adjustReserve(db, task, await rewardReserve(db, task.publisher_id, data, amount), 'create');
     for (const file of files) await saveAttachment(db, user, task.id, null, file, created);
     await saveTags(db, task.id, data.tags);
@@ -95,6 +113,7 @@ export async function editTask(pool: Pool, user: User, id: string, value: unknow
     await db.query(`UPDATE tasks SET title=$2,description=$3,criteria=$4,mode=$5,reward_type=$6,reward_units=$7,capacity=$8,deadline=$9,publication_status=$10,assignment_mode=$11,publication_note=NULL,publication_version=publication_version+1 WHERE id=$1`,
       [id, data.title, data.description, data.criteria, data.mode, data.reward_type, amount, data.capacity, data.deadline ?? null, publicationStatus, data.assignment?.mode ?? task.assignment_mode]);
     await saveTags(db, id, data.tags);
+    if (data.referenceIds) await saveReferences(db, id, data.referenceIds);
     await audit(db, user.id, 'task.edit', id);
   });
 }
@@ -239,7 +258,39 @@ export async function settleReward(pool: Pool, user: User, id: string) {
     }
   });
 }
+export async function removeCompletedTask(pool: Pool, user: User, id: string) {
+  ensure(user.role === 'admin', '仅管理员可以删除悬赏', 403);
+  await transaction(pool, async db => {
+    const task = await lockTask(db, id);
+    ensure(task.status === 'completed', '只能删除已完成的悬赏', 409);
+    await db.query('UPDATE tasks SET removed_at=now() WHERE id=$1', [id]);
+    await audit(db, user.id, 'task.remove-completed', id);
+  });
+}
+export async function setRewardVote(pool: Pool, user: User, id: string, value: unknown) {
+  const { vote } = z.object({ vote: z.enum(['low', 'high']).nullable() }).parse(value);
+  await transaction(pool, async db => {
+    const task = await lockTask(db, id); open(task);
+    ensure(task.publication_status === 'approved' && task.publisher_id !== user.id, '仅其他成员可以反馈已发布悬赏的奖励', 403);
+    if (vote === null) {
+      await db.query('DELETE FROM task_reward_feedback WHERE task_id=$1 AND user_id=$2', [id, user.id]);
+    } else {
+      await db.query(`INSERT INTO task_reward_feedback(task_id,user_id,vote) VALUES($1,$2,$3)
+        ON CONFLICT (task_id,user_id) DO UPDATE SET vote=EXCLUDED.vote`, [id, user.id, vote]);
+    }
+  });
+  return { vote };
+}
+export async function getPendingReviews(db: Db) {
+  const [pending] = await rows<PendingReviews>(db, `SELECT
+    (SELECT count(*)::int FROM tasks WHERE status='open' AND publication_status='pending' AND removed_at IS NULL) AS tasks,
+    (SELECT count(*)::int FROM registration_requests) AS registrations`);
+  return pending;
+}
 const taskSelect = `SELECT t.*,u.name AS publisher_name,
+ (SELECT vote FROM task_reward_feedback f WHERE f.task_id=t.id AND f.user_id=$1) AS reward_vote,
+ CASE WHEN t.publisher_id=$1 THEN (SELECT count(*)::int FROM task_reward_feedback f WHERE f.task_id=t.id AND f.vote='low') END AS low_votes,
+ CASE WHEN t.publisher_id=$1 THEN (SELECT count(*)::int FROM task_reward_feedback f WHERE f.task_id=t.id AND f.vote='high') END AS high_votes,
  (t.assignment_mode='assigned' AND EXISTS(SELECT 1 FROM task_recipients r WHERE r.task_id=t.id AND r.user_id=$1)) AS selected_for_viewer,
  ARRAY(SELECT tag_name FROM task_tags WHERE task_id=t.id ORDER BY tag_name) AS tags,
  (SELECT count(*)::int FROM claims c WHERE c.task_id=t.id AND c.status NOT IN ('withdrawn','cancelled')) AS claimed_count,
@@ -247,7 +298,7 @@ const taskSelect = `SELECT t.*,u.name AS publisher_name,
  (SELECT count(*)::int FROM submissions s WHERE s.task_id=t.id AND s.status='pending') AS pending_count
  FROM tasks t JOIN users u ON u.id=t.publisher_id`;
 export async function listTasks(db: Db, options: { q?: string; status?: string; reward?: string; mine?: string; userId?: string; publicationQueue?: boolean } = {}) {
-  return rows<Task>(db, `${taskSelect} WHERE ($2='' OR t.title ILIKE '%'||$2||'%' OR t.description ILIKE '%'||$2||'%' OR EXISTS (SELECT 1 FROM task_tags WHERE task_id=t.id AND tag_name ILIKE '%'||$2||'%'))
+  return rows<Task>(db, `${taskSelect} WHERE t.removed_at IS NULL AND ($2='' OR t.title ILIKE '%'||$2||'%' OR t.description ILIKE '%'||$2||'%' OR EXISTS (SELECT 1 FROM task_tags WHERE task_id=t.id AND tag_name ILIKE '%'||$2||'%'))
     AND ($3='' OR t.status=$3) AND ($4='' OR t.reward_type=$4)
     AND ($5='' OR ($5='published' AND t.publisher_id=$1) OR ($5='claimed' AND EXISTS(SELECT 1 FROM claims c WHERE c.task_id=t.id AND c.user_id=$1 AND c.status<>'withdrawn')) OR ($5='review' AND t.publisher_id=$1 AND EXISTS(SELECT 1 FROM submissions s WHERE s.task_id=t.id AND s.status='pending')))
     AND (CASE WHEN $6::boolean THEN t.publication_status='pending' AND t.status='open'
@@ -255,7 +306,7 @@ export async function listTasks(db: Db, options: { q?: string; status?: string; 
     ORDER BY t.created_at DESC LIMIT 500`, [options.userId ?? '', options.q?.slice(0, 100) ?? '', options.status ?? '', options.reward ?? '', options.mine ?? '', options.publicationQueue ?? false]);
 }
 export async function getTaskDetail(db: Db, user: User, id: string): Promise<TaskDetail> {
-  const [task] = await rows<Task>(db, `${taskSelect} WHERE t.id=$2`, [user.id, id]); ensure(task, '任务不存在', 404);
+  const [task] = await rows<Task>(db, `${taskSelect} WHERE t.id=$2 AND t.removed_at IS NULL`, [user.id, id]); ensure(task, '任务不存在', 404);
   ensure(task.publication_status === 'approved' || task.publisher_id === user.id || user.role === 'admin', '任务不存在', 404);
   const claims = await rows<Claim>(db, 'SELECT c.*,u.name FROM claims c JOIN users u ON u.id=c.user_id WHERE c.task_id=$1 ORDER BY c.created_at', [id]);
   const managing = task.publisher_id === user.id || user.role === 'admin';
@@ -264,23 +315,26 @@ export async function getTaskDetail(db: Db, user: User, id: string): Promise<Tas
     WHERE s.task_id=$1 AND ($2 OR s.submitter_id=$3 OR (s.claim_id IS NULL AND $4)) ORDER BY s.created_at DESC`, [id, managing, user.id, member]);
   const attachments = await rows<Attachment>(db, `SELECT a.id,a.task_id,a.submission_id,a.name,a.size,a.expired_at,t.ended_at+interval '15 days' AS expires_at
     FROM attachments a JOIN tasks t ON t.id=a.task_id WHERE a.task_id=$1 AND (a.submission_id IS NULL OR a.submission_id=ANY($2::text[])) ORDER BY a.created_at`, [id, submissions.map(s => s.id)]);
-  const rewards = await rows<Reward>(db, `SELECT r.*,t.title,t.publisher_id,u.name FROM rewards r JOIN tasks t ON t.id=r.task_id JOIN users u ON u.id=r.user_id WHERE r.task_id=$1 AND ($2 OR r.user_id=$3) ORDER BY r.created_at DESC`, [id, managing, user.id]);
+  const rewards = await rows<Reward>(db, `SELECT r.*,t.title,t.publisher_id,u.name,t.removed_at IS NOT NULL AS task_removed
+    FROM rewards r JOIN tasks t ON t.id=r.task_id JOIN users u ON u.id=r.user_id WHERE r.task_id=$1 AND ($2 OR r.user_id=$3) ORDER BY r.created_at DESC`, [id, managing, user.id]);
   const recipients = task.assignment_mode === 'recommended' || (task.assignment_mode === 'assigned' && managing)
     ? await rows<TaskRecipient>(db, `SELECT u.id,u.name FROM task_recipients r JOIN users u ON u.id=r.user_id
       JOIN tasks t ON t.id=r.task_id WHERE r.task_id=$1 AND (t.assignment_mode='recommended' OR $2)
       ORDER BY u.name,u.id`, [id, managing])
     : [];
-  return { task, claims, submissions, attachments, rewards, recipients };
+  const references = await rows<TaskReference>(db, `SELECT t.id,t.title FROM task_references ref JOIN tasks t ON t.id=ref.reference_id
+    WHERE ref.task_id=$1 AND ${visibleCompleted} ORDER BY t.ended_at DESC NULLS LAST,t.id`, [id]);
+  return { task, claims, submissions, attachments, rewards, recipients, references };
 }
 export async function listRewards(db: Db, user: User, managed = false) {
-  return rows<Reward>(db, `SELECT r.*,t.title,t.publisher_id,u.name FROM rewards r JOIN tasks t ON t.id=r.task_id JOIN users u ON u.id=r.user_id
+  return rows<Reward>(db, `SELECT r.*,t.title,t.publisher_id,u.name,t.removed_at IS NOT NULL AS task_removed FROM rewards r JOIN tasks t ON t.id=r.task_id JOIN users u ON u.id=r.user_id
     WHERE (NOT $2 AND r.user_id=$1) OR ($2 AND (t.publisher_id=$1 OR $3)) ORDER BY r.created_at DESC LIMIT 1000`, [user.id, managed, user.role === 'admin']);
 }
 export async function getOverview(db: Db, user: User): Promise<Overview> {
   const [overview] = await rows<Overview>(db, `SELECT
     (SELECT count(*)::int FROM tasks WHERE status='open' AND publication_status='approved') AS open_tasks,
-    (SELECT count(*)::int FROM tasks WHERE status='completed') AS completed_tasks,
-    (SELECT count(*)::int FROM submissions s JOIN tasks t ON t.id=s.task_id WHERE t.publisher_id=$1 AND s.status='pending') AS pending_reviews,
+    (SELECT count(*)::int FROM tasks WHERE status='completed' AND removed_at IS NULL) AS completed_tasks,
+    (SELECT count(*)::int FROM submissions s JOIN tasks t ON t.id=s.task_id WHERE t.publisher_id=$1 AND s.status='pending' AND t.removed_at IS NULL) AS pending_reviews,
     coalesce(sum(units) FILTER(WHERE reward_type='points'),0)::float8 AS points,
     coalesce(sum(units) FILTER(WHERE reward_type='money'),0)::float8 AS total_money,
     coalesce(sum(units) FILTER(WHERE reward_type='money' AND paid_at IS NULL),0)::float8 AS pending_money

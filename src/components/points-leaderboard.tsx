@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { Trophy } from 'lucide-react';
+import { Crown, Trophy } from 'lucide-react';
 import { api } from '@/lib/client';
 import type { PointsLeader } from '@/lib/types';
 
@@ -51,7 +51,7 @@ export function PointsLeaderboard({ initial, userId, demo }: { initial: PointsLe
     </header>
     {displayedLeaders.length > 0 ? <ol role="list">
       {displayedLeaders.map(leader => <li key={leader.id} value={leader.rank} className={!demo && leader.id === userId ? 'leaderboard-self' : undefined}>
-        <span className="leaderboard-rank" data-rank={leader.rank} aria-label={`第 ${leader.rank} 名`}>{leader.rank}</span>
+        <span className="leaderboard-rank" data-rank={leader.rank} aria-label={`第 ${leader.rank} 名`}>{leader.rank === 1 ? <Crown size={19} aria-hidden="true" /> : leader.rank}</span>
         <span className="leaderboard-name">{leader.name}{!demo && leader.id === userId && <small className="leaderboard-you">我</small>}</span>
         <strong>{leader.points.toLocaleString('zh-CN')} <small>分</small></strong>
       </li>)}

@@ -5,7 +5,7 @@ import { rows, transaction, type Db } from './db';
 import { ensure } from './rules';
 import type { RegistrationRequest, User } from './types';
 
-export const publicUserFields = 'id,username,name,role,active,must_change_password';
+export const publicUserFields = 'id,username,name,role,active,must_change_password,avatar_version';
 export const tokenHash = (value: string) => createHash('sha256').update(value).digest('hex');
 function derive(password: string, salt: string): Promise<Buffer> {
   return new Promise((resolve, reject) => scrypt(password, salt, 64, { N: 16384, r: 8, p: 1 }, (error, key) => error ? reject(error) : resolve(key)));
@@ -57,7 +57,7 @@ export async function login(pool: Pool, username: string, password: string, ip: 
 }
 export async function userForToken(db: Db, token: string | undefined | null): Promise<User | null> {
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
-  const [user] = await rows<User>(db, `SELECT u.id,u.username,u.name,u.role,u.active,u.must_change_password FROM sessions s
+  const [user] = await rows<User>(db, `SELECT u.id,u.username,u.name,u.role,u.active,u.must_change_password,u.avatar_version FROM sessions s
     JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now() AND u.active`, [tokenHash(token)]);
   return user ?? null;
 }

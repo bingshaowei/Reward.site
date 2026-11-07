@@ -24,7 +24,7 @@ export async function migrate(pool: Pool) {
   await transaction(pool, async db => {
     await db.query('SELECT pg_advisory_xact_lock(674822)');
     await db.query('CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz DEFAULT now())');
-    for (const [version, file] of [['001', '001-init.sql'], ['002', '002-publication-review.sql'], ['003', '003-attachments-tags.sql'], ['004', '004-points-wallet.sql'], ['005', '005-registration.sql'], ['006', '006-task-recipients.sql']]) {
+    for (const [version, file] of [['001', '001-init.sql'], ['002', '002-publication-review.sql'], ['003', '003-attachments-tags.sql'], ['004', '004-points-wallet.sql'], ['005', '005-registration.sql'], ['006', '006-task-recipients.sql'], ['007', '007-task-history-feedback.sql'], ['008', '008-user-avatar.sql']]) {
       if ((await rows(db, 'SELECT version FROM schema_migrations WHERE version=$1', [version])).length) continue;
       await db.query(await readFile(path.join(process.cwd(), 'db', file), 'utf8'));
       await db.query('INSERT INTO schema_migrations(version) VALUES($1)', [version]);
