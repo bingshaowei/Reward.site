@@ -1,15 +1,11 @@
 'use client';
 import { useState } from 'react';
 import { Paperclip, FileText, X, Inbox, ArrowDownToLine } from 'lucide-react';
-import type { Attachment, Task } from '@/lib/types';
+import type { Attachment } from '@/lib/types';
 import { date } from '@/lib/client';
-export const statusNames: Record<string, string> = { 'publication-pending': '待审核', 'publication-rejected': '已退回', open: '进行中', completed: '已完成', cancelled: '已取消', working: '进行中', submitted: '待验收', revision: '待修改', accepted: '已通过', withdrawn: '已退出', pending: '待验收', approved: '已通过' };
+export const statusNames: Record<string, string> = { 'publication-pending': '待审核', 'publication-rejected': '已退回', open: '进行中', 'awaiting-claim': '待领取', 'in-progress': '进行中', completed: '已完成', cancelled: '已取消', working: '进行中', submitted: '待验收', revision: '待修改', accepted: '已通过', withdrawn: '已退出', removed: '已被移除', voided: '已终止验收', pending: '待验收', approved: '已通过' };
 export function Status({ value }: { value: string }) { return <span className={`badge status-${value}`}><span className="status-dot" />{statusNames[value] ?? value}</span>; }
-export function publicationDisplayStatus(task: Task) {
-  return task.status === 'open' && task.publication_status !== 'approved'
-    ? `publication-${task.publication_status}`
-    : task.status;
-}
+export { taskDisplayStatus as publicationDisplayStatus } from '@/lib/task-status';
 export function Empty({ title = '这里还没有内容', description = '新的工作进展会显示在这里。', children }: { title?: string; description?: string; children?: React.ReactNode }) { return <div className="empty"><Inbox size={35} strokeWidth={1.2} /><h3>{title}</h3><p>{description}</p>{children}</div>; }
 export function FilePicker({ files, onChange, reference = false }: { files: File[]; onChange: (files: File[]) => void; reference?: boolean }) {
   const [error, setError] = useState('');

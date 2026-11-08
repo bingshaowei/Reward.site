@@ -145,8 +145,9 @@ export async function claimTask(pool: Pool, user: User, id: string) {
     }
     ensure(!task.team_locked, '团队已经提交成果，成员已锁定');
     const [existing] = await rows(db, 'SELECT * FROM claims WHERE task_id=$1 AND user_id=$2', [id, user.id]);
+    ensure(existing?.status !== 'removed', '你已被移除，不能再次领取这份悬赏', 403);
     ensure(!existing || existing.status === 'withdrawn', '你已领取过这个任务');
-    const [{ count }] = await rows(db, "SELECT count(*)::int AS count FROM claims WHERE task_id=$1 AND status NOT IN ('withdrawn','cancelled')", [id]);
+    const [{ count }] = await rows(db, "SELECT count(*)::int AS count FROM claims WHERE task_id=$1 AND status NOT IN ('withdrawn','cancelled','removed')", [id]);
     ensure(count < task.capacity, '任务名额已满');
     const [claim] = await rows<Claim>(db, `INSERT INTO claims(id,task_id,user_id) VALUES($1,$2,$3)
       ON CONFLICT(task_id,user_id) DO UPDATE SET status='working',created_at=now(),overdue_days_charged=0 RETURNING *`, [randomUUID(), id, user.id]);
@@ -165,6 +166,59 @@ export async function withdrawTask(pool: Pool, user: User, id: string) {
     await audit(db, user.id, 'task.withdraw', id);
   });
 }
+async function verifyRemovalAdmin(db: Db, user: User) {
+  const [actor] = await rows(db, "SELECT id FROM users WHERE id=$1 AND role='admin' AND active AND removed_at IS NULL FOR SHARE", [user.id]);
+  ensure(actor, '仅管理员可以管理承接成员', 403);
+}
+
+export async function removeClaim(pool: Pool, user: User, taskId: string, claimId: string, value: unknown) {
+  ensure(user.role === 'admin', '仅管理员可以移除承接成员', 403);
+  const { reason } = z.object({ reason: z.string().trim().min(1, '请填写移除原因').max(2000, '移除原因最多2000字') }).parse(value);
+  await transaction(pool, async db => {
+    await lockWallet(db);
+    const task = await lockTask(db, taskId); open(task);
+    await verifyRemovalAdmin(db, user);
+    const [claim] = await rows<Claim>(db, 'SELECT * FROM claims WHERE id=$1 AND task_id=$2 FOR UPDATE', [claimId, taskId]);
+    ensure(claim, '承接记录不存在', 404);
+    if (claim.status === 'removed') return;
+    ensure(['working', 'submitted', 'revision'].includes(claim.status), '只能移除尚未验收通过的承接成员', 409);
+    // 管理员移除不结算退出或尚未结算的逾期扣分，也不改动历史积分流水。
+    await db.query("UPDATE claims SET status='removed',removed_at=now(),removed_by=$2,removal_reason=$3 WHERE id=$1", [claimId, user.id, reason]);
+    if (task.mode === 'independent') {
+      await db.query("UPDATE submissions SET status='voided' WHERE claim_id=$1 AND status='pending'", [claimId]);
+    } else {
+      const [{ count }] = await rows(db, "SELECT count(*)::int AS count FROM claims WHERE task_id=$1 AND status IN ('working','submitted','revision')", [taskId]);
+      if (count === 0) {
+        await db.query("UPDATE submissions SET status='voided' WHERE task_id=$1 AND claim_id IS NULL AND status='pending'", [taskId]);
+        await db.query('UPDATE tasks SET team_locked=false WHERE id=$1', [taskId]);
+      }
+    }
+    await db.query('INSERT INTO audit_log(actor_id,action,target_id,details) VALUES($1,$2,$3,$4)', [user.id, 'claim.remove', claimId, { taskId, userId: claim.user_id }]);
+  });
+}
+
+export async function addTaskRecipients(pool: Pool, user: User, taskId: string, value: unknown) {
+  ensure(user.role === 'admin', '仅管理员可以补充指定人选', 403);
+  const { memberIds } = z.object({ memberIds: z.array(z.string().min(1).max(100)).min(1).transform(ids => [...new Set(ids)]).refine(ids => ids.length <= 100, '最多选择100名成员') }).parse(value);
+  await transaction(pool, async db => {
+    await lockWallet(db);
+    const task = await lockTask(db, taskId); open(task);
+    await verifyRemovalAdmin(db, user);
+    ensure(task.assignment_mode === 'assigned' && !task.team_locked, '仅未锁定的指定任务可以补充人选', 409);
+    const claims = await rows<Claim>(db, 'SELECT user_id,status FROM claims WHERE task_id=$1', [taskId]);
+    ensure(claims.some(c => c.status === 'removed') && claims.filter(c => !['withdrawn', 'cancelled', 'removed'].includes(c.status)).length < task.capacity, '当前没有移除后可补招的空缺', 409);
+    ensure(!claims.some(c => c.status === 'removed' && memberIds.includes(c.user_id)), '被移除的成员不能重新加入指定名单');
+    const eligible = await rows(db, 'SELECT id FROM users WHERE id=ANY($1::text[]) AND active AND removed_at IS NULL AND id<>$2 FOR SHARE', [memberIds, task.publisher_id]);
+    ensure(eligible.length === memberIds.length, '只能选择发布者以外的启用成员');
+    const existing = await rows<{ user_id: string }>(db, 'SELECT user_id FROM task_recipients WHERE task_id=$1', [taskId]);
+    const added = memberIds.filter(id => !existing.some(member => member.user_id === id));
+    ensure(existing.length + added.length <= 100, '指定名单最多100人');
+    if (!added.length) return;
+    await db.query('INSERT INTO task_recipients(task_id,user_id) SELECT $1,unnest($2::text[])', [taskId, added]);
+    await db.query('INSERT INTO audit_log(actor_id,action,target_id,details) VALUES($1,$2,$3,$4)', [user.id, 'task.add-recipients', taskId, { memberIds: added }]);
+  });
+}
+
 export async function submitWork(pool: Pool, user: User, id: string, value: unknown, files: File[] = []) {
   const data = z.object({ content: z.string().trim().min(1, '请填写交付说明').max(20000) }).parse(value);
   await validateFiles(files);
@@ -176,6 +230,7 @@ export async function submitWork(pool: Pool, user: User, id: string, value: unkn
     const [submission] = await rows<Submission>(db, 'INSERT INTO submissions(id,task_id,claim_id,submitter_id,content) VALUES($1,$2,$3,$4,$5) RETURNING *',
       [randomUUID(), id, task.mode === 'team' ? null : claim.id, user.id, data.content]);
     if (task.mode === 'team') {
+      await db.query(`INSERT INTO submission_members(submission_id,claim_id) SELECT $1,id FROM claims WHERE task_id=$2 AND status IN ('working','revision')`, [submission.id, id]);
       const members = await rows<Claim>(db, "SELECT * FROM claims WHERE task_id=$1 AND status='working'", [id]);
       for (const member of members) await chargeOverdue(db, task, member);
       await db.query('UPDATE tasks SET team_locked=true WHERE id=$1', [id]);
@@ -288,12 +343,14 @@ export async function getPendingReviews(db: Db) {
   return pending;
 }
 const taskSelect = `SELECT t.*,u.name AS publisher_name,
+ (SELECT c.status FROM claims c WHERE c.task_id=t.id AND c.user_id=$1) AS viewer_claim_status,
+ (SELECT c.removal_reason FROM claims c WHERE c.task_id=t.id AND c.user_id=$1 AND c.status='removed') AS viewer_removal_reason,
  (SELECT vote FROM task_reward_feedback f WHERE f.task_id=t.id AND f.user_id=$1) AS reward_vote,
  CASE WHEN t.publisher_id=$1 THEN (SELECT count(*)::int FROM task_reward_feedback f WHERE f.task_id=t.id AND f.vote='low') END AS low_votes,
  CASE WHEN t.publisher_id=$1 THEN (SELECT count(*)::int FROM task_reward_feedback f WHERE f.task_id=t.id AND f.vote='high') END AS high_votes,
  (t.assignment_mode='assigned' AND EXISTS(SELECT 1 FROM task_recipients r WHERE r.task_id=t.id AND r.user_id=$1)) AS selected_for_viewer,
  ARRAY(SELECT tag_name FROM task_tags WHERE task_id=t.id ORDER BY tag_name) AS tags,
- (SELECT count(*)::int FROM claims c WHERE c.task_id=t.id AND c.status NOT IN ('withdrawn','cancelled')) AS claimed_count,
+ (SELECT count(*)::int FROM claims c WHERE c.task_id=t.id AND c.status NOT IN ('withdrawn','cancelled','removed')) AS claimed_count,
  (SELECT count(*)::int FROM claims c WHERE c.task_id=t.id AND c.status='accepted') AS accepted_count,
  (SELECT count(*)::int FROM submissions s WHERE s.task_id=t.id AND s.status='pending') AS pending_count
  FROM tasks t JOIN users u ON u.id=t.publisher_id`;
@@ -308,11 +365,16 @@ export async function listTasks(db: Db, options: { q?: string; status?: string; 
 export async function getTaskDetail(db: Db, user: User, id: string): Promise<TaskDetail> {
   const [task] = await rows<Task>(db, `${taskSelect} WHERE t.id=$2 AND t.removed_at IS NULL`, [user.id, id]); ensure(task, '任务不存在', 404);
   ensure(task.publication_status === 'approved' || task.publisher_id === user.id || user.role === 'admin', '任务不存在', 404);
-  const claims = await rows<Claim>(db, 'SELECT c.*,u.name FROM claims c JOIN users u ON u.id=c.user_id WHERE c.task_id=$1 ORDER BY c.created_at', [id]);
+  const records = await rows<Claim>(db, 'SELECT c.*,u.name,actor.name AS removed_by_name FROM claims c JOIN users u ON u.id=c.user_id LEFT JOIN users actor ON actor.id=c.removed_by WHERE c.task_id=$1 ORDER BY c.created_at', [id]);
+  const claims = records.map(claim => {
+    if (user.role === 'admin' || user.id === task.publisher_id || user.id === claim.user_id) return claim;
+    const { removal_reason, removed_by, removed_by_name, removed_at, ...publicClaim } = claim;
+    return publicClaim;
+  });
   const managing = task.publisher_id === user.id || user.role === 'admin';
-  const member = claims.some(c => c.user_id === user.id && c.status !== 'withdrawn');
+  const member = claims.find(c => c.user_id === user.id && !['withdrawn', 'removed'].includes(c.status));
   const submissions = await rows<Submission>(db, `SELECT s.*,u.name AS submitter_name FROM submissions s JOIN users u ON u.id=s.submitter_id
-    WHERE s.task_id=$1 AND ($2 OR s.submitter_id=$3 OR (s.claim_id IS NULL AND $4)) ORDER BY s.created_at DESC`, [id, managing, user.id, member]);
+    WHERE s.task_id=$1 AND ($2 OR s.submitter_id=$3 OR (s.claim_id IS NULL AND EXISTS(SELECT 1 FROM submission_members sm WHERE sm.submission_id=s.id AND sm.claim_id=$4))) ORDER BY s.created_at DESC`, [id, managing, user.id, member?.id ?? null]);
   const attachments = await rows<Attachment>(db, `SELECT a.id,a.task_id,a.submission_id,a.name,a.size,a.expired_at,t.ended_at+interval '15 days' AS expires_at
     FROM attachments a JOIN tasks t ON t.id=a.task_id WHERE a.task_id=$1 AND (a.submission_id IS NULL OR a.submission_id=ANY($2::text[])) ORDER BY a.created_at`, [id, submissions.map(s => s.id)]);
   const rewards = await rows<Reward>(db, `SELECT r.*,t.title,t.publisher_id,u.name,t.removed_at IS NOT NULL AS task_removed
@@ -324,7 +386,9 @@ export async function getTaskDetail(db: Db, user: User, id: string): Promise<Tas
     : [];
   const references = await rows<TaskReference>(db, `SELECT t.id,t.title FROM task_references ref JOIN tasks t ON t.id=ref.reference_id
     WHERE ref.task_id=$1 AND ${visibleCompleted} ORDER BY t.ended_at DESC NULLS LAST,t.id`, [id]);
-  return { task, claims, submissions, attachments, rewards, recipients, references };
+  const canReplace = user.role === 'admin' && task.status === 'open' && task.assignment_mode === 'assigned' && !task.team_locked && task.claimed_count < task.capacity && claims.some(c => c.status === 'removed');
+  const replacementOptions = canReplace ? (await listRecipientOptions(db, task.publisher_id)).filter(member => member.id !== task.publisher_id && !claims.some(c => c.user_id === member.id && c.status === 'removed') && !recipients.some(r => r.id === member.id)) : undefined;
+  return { task, claims, submissions, attachments, rewards, recipients, references, ...(replacementOptions ? { replacementOptions } : {}) };
 }
 export async function listRewards(db: Db, user: User, managed = false) {
   return rows<Reward>(db, `SELECT r.*,t.title,t.publisher_id,u.name,t.removed_at IS NOT NULL AS task_removed FROM rewards r JOIN tasks t ON t.id=r.task_id JOIN users u ON u.id=r.user_id

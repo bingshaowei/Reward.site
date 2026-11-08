@@ -64,6 +64,184 @@ it('团队协作至少设置两个名额', async () => {
   expect(await make({ mode: 'team', capacity: 2 })).toMatchObject({ mode: 'team', capacity: 2 });
 });
 
+describe('管理员移除承接人', () => {
+  it('仅管理员可移除，原因必填且限长，保护隐私并释放名额且不允许重领', async () => {
+    const task = await createTask(pool, worker, input({ reward: '1' }));
+    await reviewPublication(pool, admin, task.id, { approve: true, version: task.publication_version });
+    const claim = await claimTask(pool, other, task.id);
+    await expect(taskService.removeClaim(pool, worker, task.id, claim.id, { reason: '发布者不合适' })).rejects.toMatchObject({ status: 403 });
+    for (const reason of ['', '  ', 'x'.repeat(2001)]) await expect(taskService.removeClaim(pool, admin, task.id, claim.id, { reason })).rejects.toThrow();
+    await taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '  技能不匹配  ' });
+    const detail = await getTaskDetail(pool, admin, task.id);
+    expect(detail.task.claimed_count).toBe(0);
+    expect(detail.claims[0]).toMatchObject({ status: 'removed', removal_reason: '技能不匹配', removed_by: admin.id, removed_by_name: admin.name });
+    expect((await getTaskDetail(pool, worker, task.id)).claims[0].removal_reason).toBe('技能不匹配');
+    expect((await getTaskDetail(pool, other, task.id)).claims[0].removal_reason).toBe('技能不匹配');
+    const publicClaim = (await getTaskDetail(pool, outsider, task.id)).claims[0];
+    expect(publicClaim.status).toBe('removed');
+    for (const field of ['removal_reason', 'removed_by', 'removed_by_name', 'removed_at']) expect(publicClaim).not.toHaveProperty(field);
+    await taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '重复请求不能覆盖' });
+    expect((await getTaskDetail(pool, admin, task.id)).claims[0].removal_reason).toBe('技能不匹配');
+    expect(await rows(pool, "SELECT * FROM audit_log WHERE action='claim.remove' AND target_id=$1", [claim.id])).toHaveLength(1);
+    await expect(claimTask(pool, other, task.id)).rejects.toThrow('移除');
+    await expect(submitWork(pool, other, task.id, { content: '不能继续交付' })).rejects.toThrow();
+    expect((await listTasks(pool, { mine: 'claimed', userId: other.id }))[0]).toMatchObject({ viewer_claim_status: 'removed', viewer_removal_reason: '技能不匹配' });
+    await claimTask(pool, outsider, task.id);
+  });
+
+  it('移除不扣退出费、不补扣逾期，保留已扣分并停止后续累计', async () => {
+    const task = await make({ deadline: new Date(Date.now() - 7 * 86400000).toISOString() });
+    const claim = await claimTask(pool, worker, task.id);
+    await pool.query("UPDATE claims SET created_at=now()-interval '121 hours' WHERE id=$1", [claim.id]);
+    await recordPoints(pool, worker.id, 'past-overdue', 'overdue', -10, task.id);
+    const before = (await rows(pool, 'SELECT * FROM wallet_ledger WHERE user_id=$1 ORDER BY id', [worker.id]));
+    await taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '改由其他成员处理' });
+    await getWallet(pool, worker.id);
+    const penalties = await rows(pool, "SELECT * FROM wallet_ledger WHERE user_id=$1 AND kind IN ('overdue','withdrawal') ORDER BY id", [worker.id]);
+    expect(penalties).toEqual(before.filter(entry => ['overdue', 'withdrawal'].includes(entry.kind)));
+    expect((await getTaskDetail(pool, admin, task.id)).task.points_reserved).toBe(task.points_reserved);
+  });
+
+  it('独立待验收成果终止验收并保留本人附件，新成员独立交付', async () => {
+    const task = await make();
+    const claim = await claimTask(pool, worker, task.id);
+    const submission = await submitWork(pool, worker, task.id, { content: '原有成果' }, [zip()]);
+    const attachment = (await getTaskDetail(pool, worker, task.id)).attachments[0];
+    await taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '调整执行人' });
+    expect((await getTaskDetail(pool, worker, task.id)).submissions[0].status).toBe('voided');
+    await expect(reviewWork(pool, publisher, submission.id, { approve: true })).rejects.toThrow();
+    await expect(downloadAttachment(pool, worker, attachment.id)).resolves.toBeTruthy();
+    await claimTask(pool, other, task.id);
+    await expect(downloadAttachment(pool, other, attachment.id)).rejects.toMatchObject({ status: 403 });
+    const replacement = await submitWork(pool, other, task.id, { content: '新的成果' });
+    await reviewWork(pool, publisher, replacement.id, { approve: true });
+    expect(await rows(pool, 'SELECT user_id FROM rewards WHERE task_id=$1', [task.id])).toEqual([{ user_id: other.id }]);
+    await expect(taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '任务结束不能重复移除' })).rejects.toThrow();
+  });
+
+  it('团队保留现有成果，剩一人也可验收，移除者不能看其他成员成果或附件', async () => {
+    const task = await make({ mode: 'team', capacity: 2 });
+    const claim = await claimTask(pool, worker, task.id);
+    await claimTask(pool, other, task.id);
+    const submission = await submitWork(pool, other, task.id, { content: '团队交付' }, [zip()]);
+    const attachment = (await getTaskDetail(pool, worker, task.id)).attachments[0];
+    await taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '成员不再参与' });
+    const remaining = await getTaskDetail(pool, other, task.id);
+    expect(remaining.task).toMatchObject({ team_locked: true, claimed_count: 1 });
+    expect(remaining.submissions[0].status).toBe('pending');
+    expect((await getTaskDetail(pool, worker, task.id)).submissions).toHaveLength(0);
+    await expect(downloadAttachment(pool, worker, attachment.id)).rejects.toMatchObject({ status: 403 });
+    await expect(claimTask(pool, outsider, task.id)).rejects.toThrow('锁定');
+    await reviewWork(pool, publisher, submission.id, { approve: true, allocations: { [other.id]: 100 } });
+    expect(await rows(pool, 'SELECT user_id,units FROM rewards WHERE task_id=$1', [task.id])).toEqual([{ user_id: other.id, units: 100 }]);
+  });
+
+  it('移除团队提交者不影响剩余成员的验收，待修改成员也可被移除', async () => {
+    const task = await make({ mode: 'team', capacity: 2 });
+    const workerClaim = await claimTask(pool, worker, task.id);
+    const otherClaim = await claimTask(pool, other, task.id);
+    const submission = await submitWork(pool, worker, task.id, { content: '团队旧版本' }, [zip()]);
+    const oldAttachment = (await getTaskDetail(pool, worker, task.id)).attachments[0];
+    await reviewWork(pool, publisher, submission.id, { approve: false, note: '补充说明' });
+    await taskService.removeClaim(pool, admin, task.id, workerClaim.id, { reason: '交接工作' });
+    expect((await getTaskDetail(pool, other, task.id)).submissions[0].id).toBe(submission.id);
+    const revised = await submitWork(pool, other, task.id, { content: '已完善' });
+    expect((await getTaskDetail(pool, worker, task.id)).submissions.map(s => s.id)).toEqual([submission.id]);
+    await taskService.removeClaim(pool, admin, task.id, otherClaim.id, { reason: '重新组队' });
+    expect((await getTaskDetail(pool, admin, task.id)).task).toMatchObject({ team_locked: false, claimed_count: 0 });
+    expect((await rows(pool, 'SELECT status FROM submissions WHERE id=$1', [revised.id]))[0].status).toBe('voided');
+    await claimTask(pool, outsider, task.id);
+    expect((await getTaskDetail(pool, outsider, task.id)).submissions).toHaveLength(0);
+    await expect(downloadAttachment(pool, outsider, oldAttachment.id)).rejects.toMatchObject({ status: 403 });
+    const next = await submitWork(pool, outsider, task.id, { content: '新团队新成果' });
+    await reviewWork(pool, publisher, next.id, { approve: true, allocations: { [outsider.id]: 100 } });
+  });
+
+  it('指定任务有移除空缺时可补充名单，禁止恢复被移除者并审计新增名单', async () => {
+    const task = await make({ assignment: { mode: 'assigned', memberIds: [worker.id] } });
+    await expect(taskService.addTaskRecipients(pool, admin, task.id, { memberIds: [other.id] })).rejects.toThrow();
+    const claim = await claimTask(pool, worker, task.id);
+    await taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '更换指定人选' });
+    await expect(taskService.addTaskRecipients(pool, other, task.id, { memberIds: [other.id] })).rejects.toMatchObject({ status: 403 });
+    await expect(taskService.addTaskRecipients(pool, admin, task.id, { memberIds: [worker.id] })).rejects.toThrow('移除');
+    await pool.query('UPDATE users SET active=false WHERE id=$1', [outsider.id]);
+    await expect(taskService.addTaskRecipients(pool, admin, task.id, { memberIds: [outsider.id] })).rejects.toThrow();
+    await taskService.addTaskRecipients(pool, admin, task.id, { memberIds: [other.id, other.id] });
+    expect((await getTaskDetail(pool, admin, task.id)).recipients.map(r => r.id).sort()).toEqual([worker.id, other.id].sort());
+    expect((await rows(pool, "SELECT details FROM audit_log WHERE action='task.add-recipients' AND target_id=$1", [task.id]))[0].details).toEqual({ memberIds: [other.id] });
+    await expect(editTask(pool, publisher, task.id, input())).rejects.toThrow('锁定');
+    await claimTask(pool, other, task.id);
+  });
+
+  it('非指定和锁定团队不可补招，已通过、已退出、已取消及结束任务不可移除', async () => {
+    const task = await make({ capacity: 2 });
+    const claim = await claimTask(pool, worker, task.id);
+    const submission = await submitWork(pool, worker, task.id, { content: '完成了' });
+    await reviewWork(pool, publisher, submission.id, { approve: true });
+    await expect(taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '不能撤回验收' })).rejects.toThrow();
+    const withdrawn = await claimTask(pool, other, task.id);
+    await withdrawTask(pool, other, task.id);
+    await expect(taskService.removeClaim(pool, admin, task.id, withdrawn.id, { reason: '已退出' })).rejects.toThrow();
+    await expect(taskService.addTaskRecipients(pool, admin, task.id, { memberIds: [outsider.id] })).rejects.toThrow();
+    const team = await make({ mode: 'team', capacity: 2, assignment: { mode: 'assigned', memberIds: [worker.id, other.id] } });
+    const one = await claimTask(pool, worker, team.id); await claimTask(pool, other, team.id);
+    await submitWork(pool, worker, team.id, { content: '团队成果' });
+    await taskService.removeClaim(pool, admin, team.id, one.id, { reason: '保留团队交付' });
+    await expect(taskService.addTaskRecipients(pool, admin, team.id, { memberIds: [outsider.id] })).rejects.toThrow();
+    await finishTask(pool, publisher, team.id, 'cancel');
+    const two = (await getTaskDetail(pool, admin, team.id)).claims.find(c => c.user_id === other.id)!;
+    await expect(taskService.removeClaim(pool, admin, team.id, two.id, { reason: '已取消' })).rejects.toThrow();
+  });
+
+  it('移除与验收并发只能生效一种结果，不会向已移除者发奖', async () => {
+    for (let index = 0; index < 3; index++) {
+      const task = await make(); const claim = await claimTask(pool, worker, task.id);
+      const submission = await submitWork(pool, worker, task.id, { content: '并发处理' });
+      const results = await Promise.allSettled([
+        taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '并发移除' }),
+        reviewWork(pool, publisher, submission.id, { approve: true }),
+      ]);
+      expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+      const [current] = await rows(pool, 'SELECT status FROM claims WHERE id=$1', [claim.id]);
+      expect(await rows(pool, 'SELECT * FROM rewards WHERE claim_id=$1', [claim.id])).toHaveLength(current.status === 'removed' ? 0 : 1);
+    }
+  });
+
+  it('原因2000字可保存，补位名单按最终去重总数限制100人', async () => {
+    const task = await make({ assignment: { mode: 'assigned', memberIds: [worker.id] } });
+    const claim = await claimTask(pool, worker, task.id);
+    await taskService.removeClaim(pool, admin, task.id, claim.id, { reason: '原'.repeat(2000) });
+    await pool.query("INSERT INTO users(id,username,name,password_hash,role,must_change_password) SELECT 'replacement-'||n,'replacement.'||n,'补位'||n,$1,'member',false FROM generate_series(1,100) n", [passwordHash]);
+    const ids = Array.from({ length: 99 }, (_, index) => `replacement-${index + 1}`);
+    await taskService.addTaskRecipients(pool, admin, task.id, { memberIds: [...ids, ...ids] });
+    expect((await getTaskDetail(pool, admin, task.id)).recipients).toHaveLength(100);
+    await expect(taskService.addTaskRecipients(pool, admin, task.id, { memberIds: ['replacement-100'] })).rejects.toThrow('100');
+    await expect(taskService.addTaskRecipients(pool, admin, task.id, { memberIds: [...ids, 'extra-1', 'extra-2'] })).rejects.toThrow('100');
+  });
+
+  it('迁移009保留旧团队交付并回填成员范围，不扩大其他成员访问权限', async () => {
+    const schema = `legacy_${randomUUID().replaceAll('-', '')}`;
+    await pool.query(`CREATE SCHEMA ${schema}`);
+    const legacy = new Pool({ connectionString: 'postgres://postgres:test-only-password@127.0.0.1:55439/postgres', options: `-c search_path=${schema}`, max: 1 });
+    try {
+      await legacy.query('CREATE TABLE schema_migrations(version text PRIMARY KEY,applied_at timestamptz DEFAULT now())');
+      for (const file of (await readdir('db')).filter(file => /^00[1-8]-.*\.sql$/.test(file)).sort()) {
+        await legacy.query(await readFile(path.join('db', file), 'utf8'));
+        await legacy.query('INSERT INTO schema_migrations(version) VALUES($1)', [file.slice(0, 3)]);
+      }
+      await legacy.query('INSERT INTO users SELECT * FROM public.users');
+      await legacy.query("INSERT INTO tasks(id,publisher_id,title,description,criteria,mode,reward_type,reward_units,capacity,team_locked) VALUES('legacy-team',$1,'旧团队任务','已有内容','已有要求','team','points',100,2,true)", [publisher.id]);
+      await legacy.query("INSERT INTO claims(id,task_id,user_id,status,submitted_before,created_at) VALUES('legacy-a','legacy-team',$1,'submitted',true,now()-interval '1 hour'),('legacy-b','legacy-team',$2,'submitted',true,now()-interval '1 hour')", [worker.id, other.id]);
+      await legacy.query("INSERT INTO submissions(id,task_id,claim_id,submitter_id,content) VALUES('legacy-submission','legacy-team',NULL,$1,'旧团队已有成果')", [worker.id]);
+      await migrate(legacy);
+      expect(await rows(legacy, 'SELECT claim_id FROM submission_members ORDER BY claim_id')).toEqual([{ claim_id: 'legacy-a' }, { claim_id: 'legacy-b' }]);
+      expect((await getTaskDetail(legacy, other, 'legacy-team')).submissions[0]).toMatchObject({ id: 'legacy-submission', content: '旧团队已有成果', status: 'pending' });
+      expect((await getTaskDetail(legacy, outsider, 'legacy-team')).submissions).toHaveLength(0);
+      expect((await getTaskDetail(legacy, admin, 'legacy-team')).claims.every(claim => claim.status === 'submitted')).toBe(true);
+    } finally { await legacy.end(); await pool.query(`DROP SCHEMA ${schema} CASCADE`); }
+  });
+});
+
 it('仅管理员可以删除已完成悬赏，奖励、积分流水与榜单仍保留', async () => {
   const task = await createTask(pool, publisher, input({ title: '历史归档测试' }), [zip()]);
   await expect(taskService.removeCompletedTask(pool, admin, task.id)).rejects.toMatchObject({ status: 409 });

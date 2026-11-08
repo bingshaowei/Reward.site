@@ -15,13 +15,14 @@ export type Task = {
  tags: string[];
  points_reserved: string;
  assignment_mode: AssignmentMode; selected_for_viewer: boolean;
+ viewer_claim_status?: Claim['status'] | null; viewer_removal_reason?: string | null;
  reward_vote: RewardVote | null; low_votes: number | null; high_votes: number | null;
 };
-export type Claim = { id: string; task_id: string; user_id: string; name: string; status: 'working' | 'submitted' | 'revision' | 'accepted' | 'withdrawn' | 'cancelled'; submitted_before: boolean; created_at: string; overdue_days_charged: number };
-export type Submission = { id: string; task_id: string; claim_id: string | null; submitter_id: string; submitter_name: string; content: string; status: 'pending' | 'approved' | 'revision'; review_note: string | null; created_at: string };
+export type Claim = { id: string; task_id: string; user_id: string; name: string; status: 'working' | 'submitted' | 'revision' | 'accepted' | 'withdrawn' | 'cancelled' | 'removed'; removed_at?: string | null; removed_by?: string | null; removed_by_name?: string | null; removal_reason?: string | null; submitted_before: boolean; created_at: string; overdue_days_charged: number };
+export type Submission = { id: string; task_id: string; claim_id: string | null; submitter_id: string; submitter_name: string; content: string; status: 'pending' | 'approved' | 'revision' | 'voided'; review_note: string | null; created_at: string };
 export type Attachment = { id: string; task_id: string; submission_id: string | null; name: string; size: number; expired_at: string | null; expires_at: string | null };
 export type Reward = { id: string; task_id: string; title: string; user_id: string; name: string; reward_type: 'money' | 'points'; units: number; paid_at: string | null; created_at: string; publisher_id: string; task_removed: boolean };
-export type TaskDetail = { task: Task; claims: Claim[]; submissions: Submission[]; attachments: Attachment[]; rewards: Reward[]; recipients: TaskRecipient[]; references: TaskReference[] };
+export type TaskDetail = { task: Task; claims: Claim[]; submissions: Submission[]; attachments: Attachment[]; rewards: Reward[]; recipients: TaskRecipient[]; references: TaskReference[]; replacementOptions?: RecipientOption[] };
 export type Overview = { open_tasks: number; completed_tasks: number; pending_reviews: number; points: number; total_money: number; pending_money: number };
 export type PointsLeader = { id: string; name: string; rank: number; points: number };
 export type RegistrationRequest = { id: string; username: string; name: string };

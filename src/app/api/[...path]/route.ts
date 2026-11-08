@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z, ZodError } from 'zod';
 import { getPool, rows } from '@/lib/db';
 import { login, logout, userForToken, createAccount, updateAccount, removeAccount, changePassword, publicUserFields, requestRegistration, reviewRegistration } from '@/lib/auth';
-import { createTask, editTask, listTasks, claimTask, withdrawTask, submitWork, reviewWork, reviewPublication, finishTask, settleReward, getTaskDetail, listRewards, getOverview, listPointsLeaders, removeCompletedTask, searchTaskReferences, setRewardVote, getPendingReviews } from '@/lib/tasks';
+import { createTask, editTask, listTasks, claimTask, withdrawTask, submitWork, reviewWork, reviewPublication, finishTask, settleReward, getTaskDetail, listRewards, getOverview, listPointsLeaders, removeCompletedTask, searchTaskReferences, setRewardVote, getPendingReviews, removeClaim, addTaskRecipients } from '@/lib/tasks';
 import { downloadAttachment } from '@/lib/files';
 import { assertOrigin, ensure, AppError } from '@/lib/rules';
 import { SESSION_COOKIE } from '@/lib/server';
@@ -105,6 +105,18 @@ async function handle(req: NextRequest, context: Context) {
       if (method === 'GET') return json(await getTaskDetail(pool, user, path[1]));
       if (method === 'PATCH') { const { data } = await readBody(req); await editTask(pool, user, path[1], data); return json({ ok: true }); }
       if (method === 'DELETE') { await removeCompletedTask(pool, user, path[1]); return json({ ok: true }); }
+    }
+    if (method === 'POST' && path[0] === 'tasks' && path[2] === 'claims' && path[4] === 'remove' && path.length === 5) {
+      ensure(user.role === 'admin', '仅管理员可以移除承接成员', 403);
+      const { data } = await readBody(req, 16384);
+      await removeClaim(pool, user, path[1], path[3], data);
+      return json({ ok: true });
+    }
+    if (method === 'POST' && path[0] === 'tasks' && path[2] === 'recipients' && path[3] === 'add' && path.length === 4) {
+      ensure(user.role === 'admin', '仅管理员可以补充指定人选', 403);
+      const { data } = await readBody(req, 16384);
+      await addTaskRecipients(pool, user, path[1], data);
+      return json({ ok: true });
     }
     if (method === 'POST' && path[0] === 'tasks' && path.length === 3) {
       const id = path[1], action = path[2];
