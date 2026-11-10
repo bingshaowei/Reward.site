@@ -183,15 +183,21 @@ npm run dev:local
 
 ## Linux服务器部署
 
-需要 Docker Engine 与 Compose 插件。将项目源码传到服务器，进入项目根目录，不要上传本地 `.env.local` 和 `.data`。
+需要 Docker Engine 与 Compose 插件。预构建镜像 [`bingshaowei0404/ccp-reword:1.0.0`](https://hub.docker.com/r/bingshaowei0404/ccp-reword/tags?name=1.0.0) 支持 `linux/amd64`，可直接从 Docker Hub 拉取。
+
+在服务器的部署目录中准备 `compose.yaml`、`.env.example` 和 `deploy/Caddyfile`，保留原有目录结构。首次部署时，从模板创建 `.env` 并填写数据库随机密码、初始管理员密码和服务器访问地址。
 
 ```sh
 cp .env.example .env
-# 编辑 .env：填入数据库随机密码、初始管理员密码、服务器访问地址。
-docker compose up -d --build
+# 编辑 .env 后继续。
+docker pull bingshaowei0404/ccp-reword:1.0.0
+docker tag bingshaowei0404/ccp-reword:1.0.0 internal-bounty:local
+docker compose up -d --no-build
 docker compose ps
 docker compose logs --tail=80 app cleanup
 ```
+
+`app` 和 `cleanup` 共用 `internal-bounty:local`，Compose 会另外启动 PostgreSQL 和 Caddy。如需从源码构建，请在完整的项目目录中执行 `docker compose up -d --build`。
 
 建议数据库密码使用24位以上随机字母数字，避免连接字符串中特殊字符的编码问题；管理员密码12至128位。`.env` 不要提交到版本库。首次启动完成迁移并创建管理员；再次启动保留现有账号和数据，不会重置密码。应用以非 root 用户运行。
 
@@ -270,7 +276,7 @@ docker compose -p bounty-restore up -d
 
 需要保留证书时，可在新项目 Caddy 未运行前，使用其挂载的 `/data` 卷恢复 `caddy-data.tar.gz`。恢复后检查成员登录、悬赏数量、积分与结算记录，以及附件下载。旧备份中的附件若已经到期，会按相同保留规则清理。
 
-升级前先备份，再更新源码并执行 `docker compose up -d --build`。迁移只执行一次并记录版本。若后续升级改变数据库结构，回退应使用与旧版本匹配的数据库备份；不能仅替换旧容器镜像。
+升级前先备份。使用 Docker Hub 镜像部署时，保留现有 `.env` 和数据卷，拉取目标版本，将它标记为 `internal-bounty:local`，再执行 `docker compose up -d --no-build`。使用源码部署时，更新源码后执行 `docker compose up -d --build`。迁移只执行一次并记录版本。若后续升级改变数据库结构，回退应使用与旧版本匹配的数据库备份；不能仅替换旧容器镜像。
 
 ## 开发验证
 
