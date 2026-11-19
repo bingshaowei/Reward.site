@@ -391,3 +391,9 @@ select:disabled { cursor: default; }
 /* 未完成悬赏按有效承接人数区分招募与执行状态。 */
 .status-awaiting-claim { background: #e9d7ad; color: #765727; }
 .status-in-progress { background: #dce0c7; color: #405d3a; }
+
+/* 发布确认始终位于全部填写项之后。 */
+.form-layout { grid-template-columns: minmax(0, 1fr); }
+.form-side { order: 0; }
+.form-main > .form-section:last-child { margin-bottom: 0; }
+.publish-summary { position: static; }
